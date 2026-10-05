@@ -23,7 +23,15 @@ function readRoute(): Route {
 }
 
 const MIN_HEIGHT = 220
-const MAX_HEIGHT = 760
+/** 面板绝对上限，防止在大屏上出现过长面板；小屏按可用高度再收敛 */
+const MAX_HEIGHT = 900
+
+/** 面板顶边锚定在菜单栏下方：按屏幕可用高度留出托盘偏移与底部余量（约 48px） */
+function maxHeightForScreen(): number {
+  const avail = window.screen.availHeight
+  if (!avail) return MAX_HEIGHT
+  return Math.max(MIN_HEIGHT, Math.min(MAX_HEIGHT, avail - 48))
+}
 
 export default function App(): JSX.Element {
   const route = useMemo(readRoute, [])
@@ -47,7 +55,7 @@ export default function App(): JSX.Element {
     const el = contentRef.current
     if (!el) return
     const update = (): void => {
-      const h = Math.min(MAX_HEIGHT, Math.max(MIN_HEIGHT, el.offsetHeight))
+      const h = Math.min(maxHeightForScreen(), Math.max(MIN_HEIGHT, el.offsetHeight))
       api.setHeight(h)
     }
     update()

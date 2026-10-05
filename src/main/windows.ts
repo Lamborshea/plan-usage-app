@@ -108,8 +108,11 @@ export function togglePopover(trayBounds?: Electron.Rectangle): void {
 export function setPopoverHeight(height: number): void {
   if (!popover) return
   const b = popover.getBounds()
-  // anchor to the top edge so the panel grows downward from the menu bar
-  popover.setBounds({ x: b.x, y: b.y, width: b.width, height })
+  // 顶边锚定（向下生长）：高度不得超过当前显示器的可用区域，超出部分由面板内部滚动兜底
+  const wa = screen.getDisplayNearestPoint({ x: b.x, y: b.y }).workArea
+  const maxH = Math.max(160, wa.height - Math.max(0, b.y - wa.y) - 8)
+  const h = Math.min(Math.max(height, 120), maxH)
+  popover.setBounds({ x: b.x, y: b.y, width: b.width, height: h })
   positionPopover(lastTrayBounds ?? undefined)
 }
 

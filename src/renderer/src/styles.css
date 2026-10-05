@@ -57,7 +57,7 @@ body {
   display: flex;
   align-items: center;
   gap: 6px;
-  padding: 10px 12px;
+  padding: 7px 12px;
   border-bottom: 1px solid var(--border);
   flex: none;
 }
@@ -85,8 +85,8 @@ body {
 .view {
   display: flex;
   flex-direction: column;
-  gap: 8px;
-  padding: 10px;
+  gap: 6px;
+  padding: 8px;
 }
 
 .card {
@@ -100,7 +100,7 @@ body {
   display: flex;
   align-items: center;
   gap: 6px;
-  padding: 8px 10px;
+  padding: 6px 10px;
   border-bottom: 1px solid var(--border);
   background: #fbfbfd;
 }
@@ -119,10 +119,10 @@ body {
 }
 
 .card-body {
-  padding: 10px;
+  padding: 8px 10px;
   display: flex;
   flex-direction: column;
-  gap: 8px;
+  gap: 6px;
 }
 
 .card-foot {
@@ -131,7 +131,7 @@ body {
   font-size: 10px;
   color: var(--text-3);
   border-top: 1px dashed var(--border);
-  padding-top: 6px;
+  padding-top: 4px;
 }
 
 .spacer {
@@ -231,7 +231,7 @@ body {
   border-radius: 999px;
   background: #efeff4;
   overflow: hidden;
-  margin-top: 4px;
+  margin-top: 3px;
 }
 
 .bar.thin {
@@ -248,9 +248,9 @@ body {
 .breakdowns {
   display: flex;
   flex-direction: column;
-  gap: 6px;
+  gap: 4px;
   border-top: 1px dashed var(--border);
-  padding-top: 8px;
+  padding-top: 6px;
 }
 
 .muted-row {
