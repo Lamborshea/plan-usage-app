@@ -123,7 +123,7 @@ export function SettingsView({ onSaved }: Props): JSX.Element {
           {expanded === meta.id && <ProviderForm meta={meta} onSaved={onSaved} />}
         </section>
       ))}
-      <p className="footnote">密钥仅保存在本机，使用系统安全存储（safeStorage）加密。</p>
+      <p className="footnote">密钥仅保存在本机，使用本地密钥文件（AES-256-GCM）加密。</p>
     </div>
   )
 }
