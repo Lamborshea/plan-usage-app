@@ -16,11 +16,14 @@ let tray: Tray | null = null
 let hideTimer: NodeJS.Timeout | null = null
 
 function trayIcon(): Electron.NativeImage {
-  const base = app.isPackaged ? process.resourcesPath : join(__dirname, '../../resources')
-  // 36px bitmap declared as @2x => renders at the standard 18pt menu-bar size
-  const img = nativeImage.createFromBuffer(readFileSync(join(base, 'tray@2x.png')), {
-    scaleFactor: 2
-  })
+  // The tray png ships inside app.asar at <projectRoot>/resources. Resolve it
+  // relative to out/main so it works in both dev and packaged builds. Reading
+  // from process.resourcesPath fails because those files are not copied out of
+  // the asar into Contents/Resources.
+  const img = nativeImage.createFromBuffer(
+    readFileSync(join(__dirname, '../../resources/tray@2x.png')),
+    { scaleFactor: 2 }
+  )
   img.setTemplateImage(true)
   return img
 }
