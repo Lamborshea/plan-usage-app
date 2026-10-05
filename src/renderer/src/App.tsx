@@ -37,7 +37,7 @@ export default function App(): JSX.Element {
   const route = useMemo(readRoute, [])
   const standalone = route.mode !== 'popover'
   const [pinned, setPinned] = useState(false)
-  const contentRef = useRef<HTMLDivElement>(null)
+  const bodyRef = useRef<HTMLElement>(null)
 
   useEffect(() => {
     if (!standalone) api.onPinned(setPinned)
@@ -49,18 +49,23 @@ export default function App(): JSX.Element {
     else if (route.mode === 'settings') document.title = '供应商配置'
   }, [route])
 
-  // 仅概览面板需要自适应高度；独立窗口由用户缩放
+  // 仅概览面板需要自适应高度；独立窗口由用户缩放。
+  // 注意不能测 .panel 本身：它 max-height:100% 会被当前窗口高度钳制，形成循环依赖，
+  // 导致面板永远停在初始高度。这里改测滚动容器内部内容的自然高度。
   useLayoutEffect(() => {
     if (standalone) return
-    const el = contentRef.current
-    if (!el) return
+    const body = bodyRef.current
+    const inner = body?.firstElementChild as HTMLElement | null
+    if (!body || !inner) return
     const update = (): void => {
-      const h = Math.min(maxHeightForScreen(), Math.max(MIN_HEIGHT, el.offsetHeight))
+      // body.offsetTop = 面板上边框 + 头部高度；inner 高度不受窗口钳制
+      const natural = body.offsetTop + inner.offsetHeight + 2
+      const h = Math.min(maxHeightForScreen(), Math.max(MIN_HEIGHT, natural))
       api.setHeight(h)
     }
     update()
     const ro = new ResizeObserver(update)
-    ro.observe(el)
+    ro.observe(inner)
     return () => ro.disconnect()
   }, [standalone, route])
 
@@ -84,7 +89,7 @@ export default function App(): JSX.Element {
       onMouseEnter={() => api.mouseEnter()}
       onMouseLeave={() => api.mouseLeave()}
     >
-      <div className="panel" ref={contentRef}>
+      <div className="panel">
         <header className="panel-head">
           <span className="logo-dot" />
           <span className="panel-title">Plan Usage</span>
@@ -120,7 +125,7 @@ export default function App(): JSX.Element {
           </button>
         </header>
 
-        <main className="panel-body">
+        <main className="panel-body" ref={bodyRef}>
           <SummaryView
             onOpenDetail={(id, name) => api.openDetail(id, name)}
             onOpenSettings={() => api.openSettings()}
