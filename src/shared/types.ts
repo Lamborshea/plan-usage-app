@@ -97,7 +97,8 @@ export interface UsageApi {
   listProviders(): Promise<ProviderState[]>
   getConfig(providerId: string): Promise<Record<string, string>>
   saveConfig(providerId: string, values: Record<string, string>): Promise<boolean>
-  fetchSummary(providerId: string): Promise<Result<UsageSummary>>
+  /** 缓存优先：主进程命中缓存立即返回；force=true 跳过 TTL 强制拉新 */
+  fetchSummary(providerId: string, force?: boolean): Promise<Result<UsageSummary>>
   fetchDetail(providerId: string, days: number): Promise<Result<UsageDetail>>
   testConfig(
     providerId: string,
@@ -118,4 +119,6 @@ export interface UsageApi {
   openSettings(): void
   openExternal(url: string): void
   hideWindow(): void
+  /** 退出应用（面板内退出入口，不依赖托盘右键菜单） */
+  quit(): void
 }

@@ -19,9 +19,13 @@ export function SummaryView({ onOpenDetail, onOpenSettings }: Props): JSX.Elemen
   const [slots, setSlots] = useState<Record<string, SummarySlot>>({})
   const [loggingIn, setLoggingIn] = useState<Record<string, boolean>>({})
 
-  const refresh = useCallback(async (id: string) => {
-    setSlots((s) => ({ ...s, [id]: { ...s[id], loading: true, error: undefined } }))
-    const res = await api.fetchSummary(id)
+  const refresh = useCallback(async (id: string, force = false) => {
+    // 已有数据时不整屏切加载态（仅按钮转圈）；主进程缓存优先，响应几乎即时
+    setSlots((s) => {
+      const prev = s[id]
+      return { ...s, [id]: { ...prev, loading: !prev?.summary || force, error: undefined } }
+    })
+    const res = await api.fetchSummary(id, force)
     setSlots((s) => ({
       ...s,
       [id]: { loading: false, summary: res.ok ? res.data : s[id]?.summary, error: res.ok ? undefined : res.error }
@@ -54,7 +58,7 @@ export function SummaryView({ onOpenDetail, onOpenSettings }: Props): JSX.Elemen
       for (const p of configured) void refresh(p.meta.id)
     }
     void load()
-    // 配置保存后主进程广播 data:changed，重新拉取
+    // 主进程缓存后台刷新成功/配置变化后广播 data:changed，静默回填最新快照
     api.onDataChanged(() => void load())
     return () => {
       alive = false
@@ -85,7 +89,7 @@ export function SummaryView({ onOpenDetail, onOpenSettings }: Props): JSX.Elemen
                 title="刷新"
                 onClick={(e) => {
                   e.stopPropagation()
-                  void refresh(p.meta.id)
+                  void refresh(p.meta.id, true)
                 }}
               >
                 <span className={slot?.loading ? 'spin' : ''}>

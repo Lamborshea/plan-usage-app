@@ -1,10 +1,10 @@
-import { ipcMain, shell } from 'electron'
+import { app, ipcMain, shell } from 'electron'
 import type { IpcMainInvokeEvent } from 'electron'
 import type { ProviderState, Result, UsageDetail, UsageSummary } from '../shared/types'
 import { allProviders, getProvider } from './providers'
-import type { ProviderAdapter, ProviderConfig } from './providers/types'
 import { configStore } from './store'
-import { setPopoverHeight, setPinned, isPinned, getPopover } from './windows'
+import { getDetail, getSummary, invalidateProvider, notifyChanged } from './cache'
+import { setPopoverHeight, setPinned, isPinned } from './windows'
 import { openStandalone } from './standalone'
 import { cancelScheduledHide, scheduleHide } from './tray'
 
@@ -13,14 +13,6 @@ function guard<T>(fn: () => Promise<T> | T): Promise<Result<T>> {
     .then(fn)
     .then((data) => ({ ok: true as const, data }))
     .catch((e: Error) => ({ ok: false as const, error: e.message }))
-}
-
-/** 无密钥字段的供应商（如基于本机 CLI 的百炼）视为已配置，可拿到空配置 */
-function requireConfig(provider: ProviderAdapter): ProviderConfig {
-  const stored = configStore.get(provider.meta.id)
-  if (stored) return stored
-  if (provider.meta.fields.length === 0) return {}
-  throw new Error('尚未配置密钥，请先到设置中填写')
 }
 
 export function registerIpcHandlers(): void {
@@ -48,28 +40,31 @@ export function registerIpcHandlers(): void {
     (_e: IpcMainInvokeEvent, id: string, values: Record<string, string>) => {
       if (!getProvider(id)) throw new Error(`未知供应商: ${id}`)
       configStore.set(id, values)
-      // 配置变化后通知概览面板刷新
-      const popover = getPopover()
-      if (popover && !popover.isDestroyed()) popover.webContents.send('data:changed')
+      // 配置变化后失效缓存并通知所有窗口刷新
+      invalidateProvider(id)
+      notifyChanged()
       return true
     }
   )
 
-  ipcMain.handle('usage:summary', (_e: IpcMainInvokeEvent, id: string): Promise<Result<UsageSummary>> =>
-    guard(async () => {
-      const provider = getProvider(id)
-      if (!provider) throw new Error(`未知供应商: ${id}`)
-      return provider.fetchSummary(requireConfig(provider))
-    })
+  ipcMain.handle(
+    'usage:summary',
+    (_e: IpcMainInvokeEvent, id: string, force?: boolean): Promise<Result<UsageSummary>> =>
+      guard(async () => {
+        // 缓存优先：TTL 内直接回快照；过期回旧数据 + 后台刷新（刷新完广播）
+        const snap = await getSummary(id, { force })
+        if (snap.data === null) throw new Error(snap.error ?? '暂无数据')
+        return snap.data
+      })
   )
 
   ipcMain.handle(
     'usage:detail',
     (_e: IpcMainInvokeEvent, id: string, days: number): Promise<Result<UsageDetail>> =>
       guard(async () => {
-        const provider = getProvider(id)
-        if (!provider) throw new Error(`未知供应商: ${id}`)
-        return provider.fetchDetail(requireConfig(provider), days)
+        const snap = await getDetail(id, days)
+        if (snap.data === null) throw new Error(snap.error ?? '暂无数据')
+        return snap.data
       })
   )
 
@@ -87,9 +82,9 @@ export function registerIpcHandlers(): void {
       if (!provider) throw new Error(`未知供应商: ${id}`)
       if (!provider.login) throw new Error('该供应商不支持应用内登录')
       const message = await provider.login()
-      // 登录态变化后通知概览面板刷新
-      const popover = getPopover()
-      if (popover && !popover.isDestroyed()) popover.webContents.send('data:changed')
+      // 登录态变化后失效缓存并通知所有窗口刷新
+      invalidateProvider(id)
+      notifyChanged()
       return message
     })
   )
@@ -121,5 +116,9 @@ export function registerIpcHandlers(): void {
   ipcMain.on('app:hide-window', () => {
     setPinned(false)
     scheduleHide(0)
+  })
+
+  ipcMain.on('app:quit', () => {
+    app.quit()
   })
 }

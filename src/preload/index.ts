@@ -5,7 +5,7 @@ const api: UsageApi = {
   listProviders: () => ipcRenderer.invoke('providers:list'),
   getConfig: (id) => ipcRenderer.invoke('providers:get-config', id),
   saveConfig: (id, values) => ipcRenderer.invoke('providers:save-config', id, values),
-  fetchSummary: (id) => ipcRenderer.invoke('usage:summary', id),
+  fetchSummary: (id, force) => ipcRenderer.invoke('usage:summary', id, force),
   fetchDetail: (id, days) => ipcRenderer.invoke('usage:detail', id, days),
   testConfig: (id, values) => ipcRenderer.invoke('providers:test', id, values),
   loginProvider: (id) => ipcRenderer.invoke('providers:login', id),
@@ -23,7 +23,8 @@ const api: UsageApi = {
     ipcRenderer.send('window:open-detail', providerId, providerName),
   openSettings: () => ipcRenderer.send('window:open-settings'),
   openExternal: (url) => ipcRenderer.send('app:open-external', url),
-  hideWindow: () => ipcRenderer.send('app:hide-window')
+  hideWindow: () => ipcRenderer.send('app:hide-window'),
+  quit: () => ipcRenderer.send('app:quit')
 }
 
 contextBridge.exposeInMainWorld('usageApi', api)

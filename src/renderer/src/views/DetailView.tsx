@@ -1,4 +1,4 @@
-import { useEffect, useState } from 'react'
+import { useEffect, useRef, useState } from 'react'
 import type { UsageDetail } from '../../../shared/types'
 import { api } from '../api'
 import { ChartBlock } from '../components/ChartBlock'
@@ -17,31 +17,41 @@ function ProviderDetailCard({ providerId, providerName }: CardProps): JSX.Elemen
   const [days, setDays] = useState<number>(7)
   const [loading, setLoading] = useState(true)
   const [error, setError] = useState<string | null>(null)
+  const daysRef = useRef(days)
+  daysRef.current = days
 
   useEffect(() => {
     let alive = true
     const load = async (d: number): Promise<void> => {
-      setLoading(true)
-      setError(null)
+      // 主进程缓存优先：pin 页打开前通常已预热，秒回渲染
       const res = await api.fetchDetail(providerId, d)
       if (!alive) return
-      if (res.ok) setDetail(res.data)
-      else setError(res.error)
+      if (res.ok) {
+        setDetail(res.data)
+        setError(null)
+      } else setError(res.error)
       setLoading(false)
     }
-    void load(days)
+    void load(daysRef.current)
+    // 概览后台刷新/预热完成后的广播，静默回填当前区间
+    api.onDataChanged(() => {
+      void api.fetchDetail(providerId, daysRef.current).then((res) => {
+        if (res.ok) setDetail(res.data)
+      })
+    })
     return () => {
       alive = false
     }
-    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [providerId])
 
   const changeRange = (d: number): void => {
     setDays(d)
-    setLoading(true)
     void api.fetchDetail(providerId, d).then((res) => {
-      if (res.ok) setDetail(res.data)
-      else setError(res.error)
+      // 预热过的区间即时切换；未预热的沿用旧图直到返回，避免闪烁
+      if (res.ok) {
+        setDetail(res.data)
+        setError(null)
+      } else setError(res.error)
       setLoading(false)
     })
   }

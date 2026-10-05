@@ -85,6 +85,19 @@ export function createTray(): Tray {
     { label: '退出', click: () => app.quit() }
   ])
   tray.on('right-click', () => {
+    // 面板是 screen-saver 级置顶，会盖住右键菜单（含"退出"入口）：
+    // 弹菜单前先隐藏面板，菜单关闭后若仍处于固定状态再恢复
+    const win = getPopover()
+    const wasVisible = !!win && win.isVisible()
+    if (wasVisible) win?.hide()
+    const restore = (): void => {
+      if (wasVisible && isPinned()) showPopover(bounds())
+    }
+    if (wasVisible) {
+      contextMenu.once('menu-will-close', restore)
+      // 兜底：事件异常未触发时最迟 15s 后恢复，避免面板永久消失
+      setTimeout(restore, 15_000)
+    }
     tray?.popUpContextMenu(contextMenu)
   })
 

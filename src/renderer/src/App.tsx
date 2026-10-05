@@ -3,7 +3,7 @@ import { api } from './api'
 import { SummaryView } from './views/SummaryView'
 import { DetailView } from './views/DetailView'
 import { SettingsView } from './views/SettingsView'
-import { IconClose, IconExpand, IconGear, IconPin } from './components/Icons'
+import { IconClose, IconExpand, IconGear, IconPin, IconQuit } from './components/Icons'
 
 /** 窗口路由：由 URL query 决定该窗口渲染概览面板、详情还是配置。 */
 type Route =
@@ -97,6 +97,15 @@ export default function App(): JSX.Element {
           </button>
           <button className="icon-btn" title="设置" onClick={() => api.openSettings()}>
             <IconGear />
+          </button>
+          <button
+            className="icon-btn"
+            title="退出应用"
+            onClick={() => {
+              if (window.confirm('确定退出 Plan Usage 吗？退出后需重新启动才会出现在菜单栏。')) api.quit()
+            }}
+          >
+            <IconQuit />
           </button>
           <button className="icon-btn" title="隐藏" onClick={() => api.hideWindow()}>
             <IconClose />
