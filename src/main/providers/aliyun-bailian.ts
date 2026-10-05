@@ -1,5 +1,6 @@
 import { execFile, spawn } from 'node:child_process'
-import { existsSync } from 'node:fs'
+import { readFileSync, existsSync } from 'node:fs'
+import os from 'node:os'
 import path from 'node:path'
 import { promisify } from 'node:util'
 import { app } from 'electron'
@@ -9,72 +10,235 @@ import { ProviderApiError, type ProviderAdapter, type ProviderConfig } from './t
 const execFileAsync = promisify(execFile)
 
 /* ------------------------------------------------------------------ *
- * 百炼 Agent 套餐用量：通过官方 CLI（bl）的 Console 鉴权通道查询
- *   - bl usage token-plan  → Token Plan 个人版（并发 Agent 套餐）5 小时 / 1 周额度
- *   - bl usage coding-plan → Coding Plan 5 小时 / 周 / 账期额度
- * 两者均为实时快照，返回 0-1 的小数百分比与重置时间戳（毫秒）。
+ * 百炼 Agent 套餐用量（Token Plan 个人版 / Coding Plan）
+ *
+ * 实测网关（bl 同款通道）返回的真实字段为月度窗口 per1MonthPercentage 等，
+ * 而 bailian-cli 2.1.0 的 `usage token-plan` 输出映射只挑 per5Hour/per1Week
+ * 四个键，会把 per1Month 数据丢弃成 {}。因此本供应商不走 CLI 查询，
+ * 直接读取 CLI 登录态（~/.bailian/config.json）的 console access token，
+ * 复刻 bl 的控制台网关调用获取原始用量数据；登录授权仍复用内置 bl CLI。
+ * 接口与真实返回结构详见 docs/bailian.md。
  * ------------------------------------------------------------------ */
 
-/**
- * `bl usage token-plan --output json` 输出。
- * 网关 API：zeldaHttp.apikeyMgr./tokenplan/personal/api/v2/usage（请求体 {}）。
- * CLI 仅保留有限数字类型的这 4 个字段；未订阅个人版时输出 {}。
- * 详见 docs/bailian.md《usage token-plan》。
- */
 interface TokenPlanUsage {
-  /** 5 小时窗口额度使用比例，0–1 小数（如 0.32 = 32%） */
+  /** 5 小时窗口使用比例，0–1 小数 */
   per5HourPercentage?: number
   /** 5 小时窗口重置时间，毫秒时间戳 */
   per5HourResetTime?: number
-  /** 1 周窗口额度使用比例，0–1 小数 */
+  /** 1 周窗口使用比例，0–1 小数 */
   per1WeekPercentage?: number
   /** 1 周窗口重置时间，毫秒时间戳 */
   per1WeekResetTime?: number
+  /** 1 月窗口使用比例，0–1 小数（当前个人版套餐实际返回的窗口） */
+  per1MonthPercentage?: number
+  /** 1 月窗口重置时间，毫秒时间戳 */
+  per1MonthResetTime?: number
 }
 
-/**
- * Coding Plan 单个额度窗口。
- * 由原始字段 {前缀}UsedQuota / TotalQuota / QuotaNextRefreshTime 映射而来，
- * 原始字段缺失则对应键省略。
- */
+/** Coding Plan 单个额度窗口（原始字段 {前缀}UsedQuota/TotalQuota/QuotaNextRefreshTime 映射而来） */
 interface PlanWindow {
   /** 本窗口已用额度（次数） */
   usedQuota?: number
   /** 本窗口总额度（次数） */
   totalQuota?: number
-  /** 窗口重置时间，毫秒时间戳（原始 *QuotaNextRefreshTime） */
+  /** 窗口重置时间，毫秒时间戳 */
   resetTime?: number
-  /** CLI 计算的 usedQuota/totalQuota，仅当两者存在且 totalQuota>0 时输出 */
+  /** usedQuota/totalQuota，仅当两者存在且 totalQuota>0 时可计算 */
   percentage?: number
 }
 
-/**
- * `bl usage coding-plan --output json` 输出。
- * 网关 API：zeldaEasy.broadscope-bailian.codingPlan.queryCodingPlanInstanceInfoV2，
- * 取 codingPlanInstanceInfos 中首个 status==='VALID' 实例的 codingPlanQuotaInfo；
- * 无有效订阅时输出 {}。详见 docs/bailian.md《usage coding-plan》。
- */
 interface CodingPlanUsage {
   per5Hour?: PlanWindow
   perWeek?: PlanWindow
   perBillMonth?: PlanWindow
-  /** 实例规格（如 pro / max），仅当 CLI 返回非空字符串时存在 */
+  /** 实例规格（如 pro / max） */
   instanceType?: string
 }
 
-/**
- * bl 失败时的错误对象。code 枚举（bailian-cli-core）：0 SUCCESS / 1 GENERAL /
- * 2 USAGE / 3 AUTH（未登录或 Console 会话过期）/ 4 QUOTA / 5 TIMEOUT / 6 NETWORK。
- */
-interface BlCliError {
-  code?: number
-  message?: string
-  hint?: string
+/* ------------------------------------------------------------------ *
+ * Console 凭证：bl 登录后写入 ~/.bailian/config.json 的 access_token
+ * ------------------------------------------------------------------ */
+
+interface ConsoleSession {
+  token: string
+  region: string
+  site: string
+  switchAgent?: number
+}
+
+function loadConsoleSession(): ConsoleSession | null {
+  const envHome = process.env.BAILIAN_CONFIG_DIR || path.join(os.homedir(), '.bailian')
+  const file = path.join(envHome, 'config.json')
+  if (!existsSync(file)) return null
+  let cfg: Record<string, unknown>
+  try {
+    cfg = JSON.parse(readFileSync(file, 'utf8')) as Record<string, unknown>
+  } catch {
+    return null
+  }
+  const token = typeof cfg.access_token === 'string' ? cfg.access_token.trim() : ''
+  if (!token) return null
+  return {
+    token,
+    region: typeof cfg.console_region === 'string' && cfg.console_region ? cfg.console_region : 'cn-beijing',
+    site: cfg.console_site === 'international' ? 'international' : 'domestic',
+    switchAgent: typeof cfg.console_switch_agent === 'number' ? cfg.console_switch_agent : undefined
+  }
 }
 
 /* ------------------------------------------------------------------ *
- * bl 执行器定位：优先使用随 app 分发的内置 bailian-cli（用 Electron
- * 自带的 Node 运行时直接跑它的 ESM 入口，用户无需安装 Node 或 CLI），
+ * 控制台网关调用（复刻 bl 的 BroadScopeAspnGateway 通道）
+ * ------------------------------------------------------------------ */
+
+const GATEWAYS: Record<string, Record<string, { host: string; action: string }>> = {
+  'cn-beijing': {
+    domestic: { host: 'bailian-cs.console.aliyun.com', action: 'BroadScopeAspnGateway' },
+    international: { host: 'bailian-cs.console.alibabacloud.com', action: 'BroadScopeAspnGateway' }
+  },
+  'ap-southeast-1': {
+    domestic: { host: 'modelstudio-cs.console.aliyun.com', action: 'IntlBroadScopeAspnGateway' },
+    international: { host: 'bailian-singapore-cs.console.alibabacloud.com', action: 'IntlBroadScopeAspnGateway' }
+  }
+}
+
+const num = (v: unknown): number | undefined =>
+  typeof v === 'number' && Number.isFinite(v) ? v : undefined
+
+/** 与 bl 的 unwrapResponse 一致：剥离网关信封 data → DataV2.data(.data) */
+function unwrap(raw: Record<string, unknown>): Record<string, unknown> {
+  const d = raw.data as Record<string, unknown> | undefined
+  if (!d) return raw
+  const v2 = d.DataV2 as Record<string, unknown> | undefined
+  if (v2) {
+    const inner = v2.data as Record<string, unknown> | undefined
+    if (inner && typeof inner.data === 'object' && inner.data !== null) {
+      return inner.data as Record<string, unknown>
+    }
+    return inner ?? v2
+  }
+  return typeof d.data === 'object' && d.data !== null ? (d.data as Record<string, unknown>) : d
+}
+
+async function consoleCall(
+  session: ConsoleSession,
+  api: string,
+  data: Record<string, unknown>
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+): Promise<any> {
+  const payload = {
+    Api: api,
+    V: '1.0',
+    Data: {
+      ...data,
+      cornerstoneParam: {
+        protocol: 'V2',
+        console: 'ONE_CONSOLE',
+        productCode: 'p_efm',
+        switchUserType: 3,
+        consoleSite: 'BAILIAN_ALIYUN',
+        ...(session.switchAgent == null ? {} : { switchAgent: session.switchAgent })
+      }
+    }
+  }
+  const gw = GATEWAYS[session.region]?.[session.site] ?? GATEWAYS['cn-beijing'].domestic
+  const url = `https://${gw.host}/cli/api.json?action=${gw.action}&product=sfm_bailian&api=${encodeURIComponent(api)}`
+  let res: Response
+  try {
+    res = await fetch(url, {
+      method: 'POST',
+      headers: {
+        Accept: '*/*',
+        'Content-Type': 'application/x-www-form-urlencoded',
+        Authorization: `Bearer ${session.token}`
+      },
+      body: new URLSearchParams({ params: JSON.stringify(payload), region: session.region }).toString(),
+      signal: AbortSignal.timeout(30_000)
+    })
+  } catch (e) {
+    throw new ProviderApiError(`百炼网关请求失败: ${(e as Error).message}`)
+  }
+  const text = await res.text().catch(() => '')
+  if (!res.ok) throw new ProviderApiError(`百炼网关 HTTP ${res.status}: ${text.slice(0, 200)}`)
+  let raw: Record<string, unknown>
+  try {
+    raw = JSON.parse(text) as Record<string, unknown>
+  } catch {
+    throw new ProviderApiError(`百炼网关响应解析失败: ${text.slice(0, 200) || '（无输出）'}`)
+  }
+  const inner = (raw.data ?? {}) as Record<string, unknown>
+  const errorCode = String(inner.errorCode ?? '')
+  if (inner.success === false || (errorCode && errorCode !== 'SUCCESS')) {
+    if (errorCode.includes('NotLogined')) {
+      throw new ProviderApiError('百炼登录态已过期，请点击下方「登录百炼」重新授权')
+    }
+    throw new ProviderApiError(`百炼网关错误: ${errorCode || String(inner.errorMsg ?? '未知错误')}`)
+  }
+  return unwrap(raw)
+}
+
+/* ------------------------------------------------------------------ *
+ * 真实返回字段 → 供应商数据模型
+ * ------------------------------------------------------------------ */
+
+/** tokenplan/personal/api/v2/usage：只保留有限数字字段（与 bl 的过滤规则一致） */
+function toTokenPlan(usage: Record<string, unknown>): TokenPlanUsage | null {
+  const out: TokenPlanUsage = {}
+  for (const key of [
+    'per5HourPercentage',
+    'per5HourResetTime',
+    'per1WeekPercentage',
+    'per1WeekResetTime',
+    'per1MonthPercentage',
+    'per1MonthResetTime'
+  ] as const) {
+    const v = num(usage[key])
+    if (v !== undefined) out[key] = v
+  }
+  return Object.keys(out).length > 0 ? out : null
+}
+
+function toWindow(raw: Record<string, unknown> | undefined, prefix: string): PlanWindow | undefined {
+  if (!raw) return undefined
+  const used = num(raw[`${prefix}UsedQuota`])
+  const total = num(raw[`${prefix}TotalQuota`])
+  const reset = num(raw[`${prefix}QuotaNextRefreshTime`])
+  const w: PlanWindow = {}
+  if (used !== undefined) w.usedQuota = used
+  if (total !== undefined) w.totalQuota = total
+  if (reset !== undefined) w.resetTime = reset
+  if (used !== undefined && total !== undefined && total > 0) w.percentage = used / total
+  return Object.keys(w).length > 0 ? w : undefined
+}
+
+/** queryCodingPlanInstanceInfoV2：取首个 VALID 实例的额度信息 */
+function toCodingPlan(resp: Record<string, unknown>): CodingPlanUsage | null {
+  const list = Array.isArray(resp.codingPlanInstanceInfos)
+    ? (resp.codingPlanInstanceInfos as Record<string, unknown>[])
+    : []
+  const inst = list.find((e) => e.status === 'VALID')
+  if (!inst) return null
+  const quota = (inst.codingPlanQuotaInfo ?? {}) as Record<string, unknown>
+  const out: CodingPlanUsage = {}
+  const w5 = toWindow(quota, 'per5Hour')
+  const ww = toWindow(quota, 'perWeek')
+  const wm = toWindow(quota, 'perBillMonth')
+  if (w5) out.per5Hour = w5
+  if (ww) out.perWeek = ww
+  if (wm) out.perBillMonth = wm
+  if (typeof inst.instanceType === 'string' && inst.instanceType) out.instanceType = inst.instanceType
+  return Object.keys(out).length > 0 ? out : null
+}
+
+const TOKEN_PLAN_API = 'zeldaHttp.apikeyMgr./tokenplan/personal/api/v2/usage'
+const CODING_PLAN_API = 'zeldaEasy.broadscope-bailian.codingPlan.queryCodingPlanInstanceInfoV2'
+const CODING_PLAN_COMMODITY: Record<string, string> = {
+  domestic: 'sfm_codingplan_public_cn',
+  international: 'sfm_codingplan_public_intl'
+}
+
+/* ------------------------------------------------------------------ *
+ * bl 执行器定位：登录授权需要拉起内置 CLI（用 Electron 自带的 Node
+ * 运行时直接跑它的 ESM 入口，用户无需安装 Node 或 CLI），
  * 找不到内置脚本时再回退系统安装的 bl（GUI 启动时 PATH 通常不含
  * npm 全局目录，需要常见路径 + 登录 shell 兜底）。
  * ------------------------------------------------------------------ */
@@ -172,41 +336,6 @@ async function resolveLauncher(): Promise<BlLauncher> {
   )
 }
 
-/** 执行 bl 子命令并解析 JSON 输出 */
-async function runBl(args: string[]): Promise<Record<string, unknown>> {
-  const launcher = await resolveLauncher()
-  let stdout = ''
-  let stderr = ''
-  try {
-    const r = await execFileAsync(launcher.cmd, [...launcher.prefix, ...args], {
-      timeout: 60_000,
-      env: launcher.env
-    })
-    stdout = r.stdout
-    stderr = r.stderr
-  } catch (e) {
-    const err = e as { stdout?: string; stderr?: string; message?: string }
-    stdout = err.stdout ?? ''
-    stderr = err.stderr ?? ''
-  }
-  const text = (stdout || stderr).trim()
-  let json: Record<string, unknown>
-  try {
-    json = JSON.parse(text) as Record<string, unknown>
-  } catch {
-    throw new ProviderApiError(`百炼 CLI 输出解析失败: ${text || '（无输出）'}`)
-  }
-  const cliErr = json.error as BlCliError | undefined
-  if (cliErr) {
-    if (cliErr.code === 3 || /console access token|not authenticated/i.test(cliErr.message ?? '')) {
-      throw new ProviderApiError('百炼未登录控制台，请点击下方「登录百炼」完成授权')
-    }
-    const hint = cliErr.hint ? `（${cliErr.hint}）` : ''
-    throw new ProviderApiError(`百炼 CLI: ${cliErr.message ?? '未知错误'}${hint}`)
-  }
-  return json
-}
-
 /**
  * 拉起控制台 OAuth 登录（浏览器授权，本地端口回调）。
  * bl 为非交互命令：打开浏览器后等待回调，exit 0 即登录成功。
@@ -253,37 +382,35 @@ interface PlanUsage {
   coding: CodingPlanUsage | null
 }
 
-const isBlank = (o: Record<string, unknown>): boolean => Object.keys(o).length === 0
-
-function hasWindow(c: CodingPlanUsage): boolean {
-  return Boolean(c.per5Hour || c.perWeek || c.perBillMonth)
-}
-
 async function collect(_config: ProviderConfig): Promise<PlanUsage> {
+  const session = loadConsoleSession()
+  if (!session) {
+    throw new ProviderApiError('百炼未登录控制台，请点击下方「登录百炼」完成授权')
+  }
   const [tp, cp] = await Promise.allSettled([
-    runBl(['usage', 'token-plan', '--output', 'json']),
-    runBl(['usage', 'coding-plan', '--output', 'json'])
+    consoleCall(session, TOKEN_PLAN_API, {}).then(toTokenPlan),
+    consoleCall(session, CODING_PLAN_API, {
+      queryCodingPlanInstanceInfoRequest: {
+        commodityCode: CODING_PLAN_COMMODITY[session.site],
+        onlyLatestOne: true
+      }
+    }).then(toCodingPlan)
   ])
-  // 鉴权/环境问题两边一致，任一失败即透出，避免静默吞掉真实错误
-  const fatal = (r: PromiseRejectedResult): never => {
+  const fail = (r: PromiseRejectedResult): never => {
     throw r.reason instanceof ProviderApiError
       ? r.reason
       : new ProviderApiError(`百炼用量查询失败: ${(r.reason as Error).message}`)
   }
-  let token: TokenPlanUsage | null = null
-  let coding: CodingPlanUsage | null = null
   const tpErr = tp.status === 'rejected' ? tp : null
   const cpErr = cp.status === 'rejected' ? cp : null
-  if (tpErr && cpErr) fatal(tpErr)
-  if (tp.status === 'fulfilled' && !isBlank(tp.value)) token = tp.value as TokenPlanUsage
-  if (cp.status === 'fulfilled' && !isBlank(cp.value) && hasWindow(cp.value as CodingPlanUsage)) {
-    coding = cp.value as CodingPlanUsage
-  }
+  if (tpErr && cpErr) fail(tpErr)
+  const token = tp.status === 'fulfilled' ? tp.value : null
+  const coding = cp.status === 'fulfilled' ? cp.value : null
   if (!token && !coding) {
     // 只剩一个接口成功时，透出另一个的真实错误
-    if (tpErr) fatal(tpErr)
-    if (cpErr) fatal(cpErr)
-    throw new ProviderApiError('当前账号未查询到 Token Plan / Coding Plan 套餐用量')
+    if (tpErr) fail(tpErr)
+    if (cpErr) fail(cpErr)
+    throw new ProviderApiError('登录成功，但当前账号未查询到 Token Plan / Coding Plan 套餐')
   }
   return { token, coding }
 }
@@ -296,7 +423,12 @@ const pct = (fraction: number | undefined): number | undefined =>
   fraction === undefined ? undefined : Math.round(fraction * 1000) / 10
 
 const hasQuota = (u: TokenPlanUsage | null): boolean =>
-  Boolean(u && (u.per5HourPercentage !== undefined || u.per1WeekPercentage !== undefined))
+  Boolean(
+    u &&
+      (u.per5HourPercentage !== undefined ||
+        u.per1WeekPercentage !== undefined ||
+        u.per1MonthPercentage !== undefined)
+  )
 
 function fmtReset(ms: number | undefined): string | undefined {
   if (ms === undefined || !Number.isFinite(ms)) return undefined
@@ -348,15 +480,9 @@ export const aliyunBailianAdapter: ProviderAdapter = {
 
   login: loginConsole,
 
-  /** 百炼凭证由 CLI 管理（~/.bailian），以控制台登录态判断可用性 */
+  /** 百炼凭证由 CLI 管理（~/.bailian/config.json 的 access_token），以登录态判断可用性 */
   async isAvailable() {
-    try {
-      const status = await runBl(['auth', 'status', '--output', 'json'])
-      const consoleAuth = status.console as { source?: string } | undefined
-      return Boolean(consoleAuth?.source)
-    } catch {
-      return false
-    }
+    return loadConsoleSession() !== null
   },
 
   async fetchSummary(config: ProviderConfig): Promise<UsageSummary> {
@@ -366,25 +492,20 @@ export const aliyunBailianAdapter: ProviderAdapter = {
 
     if (hasQuota(usage.token)) {
       const t = usage.token as TokenPlanUsage
-      metrics.push(
-        {
-          label: 'Token Plan · 5 小时用量',
-          value: pct(t.per5HourPercentage) !== undefined ? `${pct(t.per5HourPercentage)}%` : '—',
-          percent: pct(t.per5HourPercentage),
-          sub: fmtReset(t.per5HourResetTime)
-        },
-        {
-          label: 'Token Plan · 1 周用量',
-          value: pct(t.per1WeekPercentage) !== undefined ? `${pct(t.per1WeekPercentage)}%` : '—',
-          percent: pct(t.per1WeekPercentage),
-          sub: fmtReset(t.per1WeekResetTime)
-        }
-      )
-      if (t.per5HourPercentage !== undefined) {
-        breakdowns.push({ name: 'Token Plan 5 小时窗口', used: pct(t.per5HourPercentage) as number, total: 100, unit: '%' })
-      }
-      if (t.per1WeekPercentage !== undefined) {
-        breakdowns.push({ name: 'Token Plan 1 周窗口', used: pct(t.per1WeekPercentage) as number, total: 100, unit: '%' })
+      const windows: [string, number | undefined, number | undefined][] = [
+        ['5 小时', t.per5HourPercentage, t.per5HourResetTime],
+        ['1 周', t.per1WeekPercentage, t.per1WeekResetTime],
+        ['1 个月', t.per1MonthPercentage, t.per1MonthResetTime]
+      ]
+      for (const [name, p, reset] of windows) {
+        if (p === undefined) continue
+        metrics.push({
+          label: `Token Plan · ${name}用量`,
+          value: `${pct(p)}%`,
+          percent: pct(p),
+          sub: fmtReset(reset)
+        })
+        breakdowns.push({ name: `Token Plan ${name}窗口`, used: pct(p) as number, total: 100, unit: '%' })
       }
     }
 
@@ -420,8 +541,14 @@ export const aliyunBailianAdapter: ProviderAdapter = {
     const rateCats: { name: string; value: number }[] = []
     if (hasQuota(usage.token)) {
       const t = usage.token as TokenPlanUsage
-      if (t.per5HourPercentage !== undefined) rateCats.push({ name: 'TP 5小时', value: pct(t.per5HourPercentage) as number })
-      if (t.per1WeekPercentage !== undefined) rateCats.push({ name: 'TP 每周', value: pct(t.per1WeekPercentage) as number })
+      const entries: [string, number | undefined][] = [
+        ['TP 5小时', t.per5HourPercentage],
+        ['TP 每周', t.per1WeekPercentage],
+        ['TP 每月', t.per1MonthPercentage]
+      ]
+      for (const [name, p] of entries) {
+        if (p !== undefined) rateCats.push({ name, value: pct(p) as number })
+      }
     }
     if (usage.coding) {
       const c = usage.coding
@@ -455,7 +582,7 @@ export const aliyunBailianAdapter: ProviderAdapter = {
 
     return {
       charts,
-      note: '百炼 CLI 提供当前套餐周期的实时额度快照，额度按窗口自动重置，暂无历史趋势数据。'
+      note: '百炼套餐额度为当前周期实时快照，按窗口自动重置，暂无历史趋势数据。'
     }
   }
 }
