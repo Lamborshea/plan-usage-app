@@ -85,14 +85,18 @@ function ProviderForm({ meta, onSaved }: { meta: ProviderMeta; onSaved: () => vo
       {form.message && (
         <div className={form.message.kind === 'ok' ? 'msg-ok' : 'msg-err'}>{form.message.text}</div>
       )}
-      <div className="settings-actions">
-        <button className="btn primary" onClick={() => void save()} disabled={form.saving}>
-          {form.saving ? '保存中…' : '保存'}
-        </button>
-        <button className="btn" onClick={() => void test()} disabled={form.testing}>
-          {form.testing ? '测试中…' : '测试连接'}
-        </button>
-      </div>
+      {meta.fields.length > 0 ? (
+        <div className="settings-actions">
+          <button className="btn primary" onClick={() => void save()} disabled={form.saving}>
+            {form.saving ? '保存中…' : '保存'}
+          </button>
+          <button className="btn" onClick={() => void test()} disabled={form.testing}>
+            {form.testing ? '测试中…' : '测试连接'}
+          </button>
+        </div>
+      ) : (
+        <p className="muted-text">无需填写密钥。请在菜单栏用量面板点击「登录{meta.name}」完成浏览器授权。</p>
+      )}
     </div>
   )
 }
