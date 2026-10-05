@@ -1,5 +1,5 @@
 {
-  "name": "agent-usage-app",
+  "name": "plan-usage-app",
   "version": "0.1.0",
   "description": "Menu bar app to monitor AI provider (agent) usage quotas",
   "main": "./out/main/index.js",
@@ -7,11 +7,36 @@
   "scripts": {
     "dev": "electron-vite dev",
     "build": "electron-vite build",
+    "build:mac": "npm run build && electron-builder --mac",
+    "build:dir": "npm run build && electron-builder --mac --dir",
     "start": "electron-vite preview",
     "typecheck": "tsc --noEmit -p tsconfig.node.json && tsc --noEmit -p tsconfig.web.json",
     "gen:icons": "node scripts/gen-tray-icon.mjs"
   },
+  "build": {
+    "appId": "com.lamborshea.plan-usage-app",
+    "productName": "Plan Usage",
+    "directories": {
+      "output": "release"
+    },
+    "asar": true,
+    "asarUnpack": [
+      "node_modules/bailian-cli/**"
+    ],
+    "electronDownload": {
+      "mirror": "https://npmmirror.com/mirrors/electron/"
+    },
+    "mac": {
+      "target": [
+        "dmg",
+        "zip"
+      ],
+      "category": "public.app-category.developer-tools",
+      "identity": null
+    }
+  },
   "dependencies": {
+    "bailian-cli": "^2.1.0",
     "react": "^18.3.1",
     "react-dom": "^18.3.1",
     "recharts": "^2.15.0"
@@ -22,6 +47,7 @@
     "@types/react-dom": "^18.3.1",
     "@vitejs/plugin-react": "^4.3.4",
     "electron": "^33.2.0",
+    "electron-builder": "^26.15.3",
     "electron-vite": "^2.3.0",
     "typescript": "^5.7.2",
     "vite": "^5.4.11"

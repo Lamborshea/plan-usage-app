@@ -1,22 +1,74 @@
-import type { UsageDetail, UsageSummary } from '../../shared/types'
+import type { DetailChart, UsageDetail, UsageSummary } from '../../shared/types'
 import { signVolc } from './signing/volc'
 import { ProviderApiError, requestJson, type ProviderAdapter, type ProviderConfig } from './types'
 
-const ENDPOINT = 'https://ark.cn-beijing.volcengineapi.com/?Action=GetUsageDetails&Version=2024-01-01'
+const ENDPOINT = 'https://ark.cn-beijing.volcengineapi.com'
 const REGION = 'cn-beijing'
 const SERVICE = 'ark'
 
+/**
+ * 火山方舟 OpenAPI 响应类型。字段结构以实际接口响应为准，
+ * 见 docs/volcengine.md（含 GetAFPUsage / GetUsageDetails 的响应样例）。
+ */
+
+/** 所有方舟 OpenAPI 响应的公共元数据；出错时 Error 非空 */
+interface ArkResponseMetadata {
+  RequestId?: string
+  Action?: string
+  Version?: string
+  Service?: string
+  Region?: string
+  Error?: { Code?: string; Message?: string }
+}
+
+/** 个人版 Agent Plan 套餐档位（GetUsageDetails 数字编码：1=Small 2=Medium 3=Large 4=Max） */
+type PlanTier = 'Small' | 'Medium' | 'Large' | 'Max'
+
+/** 计费类型：套餐内 / 套餐外 */
+type ArkBillingType = 'WithinPlan' | 'OutsideOfPlan'
+
+/**
+ * 单条用量明细。注意：同一模型同一 Time 可能出现多条记录
+ * （实际响应验证过），需要调用方自行按 模型+时间 聚合。
+ */
 interface UsageDetailItem {
+  /** Unix 毫秒时间戳，按 QueryInterval 对齐（Day=当天 0 点） */
   Time: number
+  /** 模型 / Harness 名称 */
   ObjectName: string
   Usage: number
+  /** 单位，如 Tokens、Images */
   Unit: string
-  BillingType: string
+  BillingType: ArkBillingType
 }
 
 interface UsageDetailsResponse {
-  ResponseMetadata?: { RequestId?: string; Error?: { Code?: string; Message?: string } }
+  ResponseMetadata?: ArkResponseMetadata
   Result?: { Details: UsageDetailItem[] }
+}
+
+/** AFP 滚动窗口配额（GetAFPUsage），时间均为 epoch 毫秒 */
+interface AFPWindow {
+  /** 窗口总配额（AFP） */
+  Quota: number
+  /** 窗口内已用量（AFP） */
+  Used: number
+  /** 窗口起始时间 */
+  SubscribeTime: number
+  /** 下次重置时间 */
+  ResetTime: number
+}
+
+interface AFPUsageResponse {
+  ResponseMetadata?: ArkResponseMetadata
+  Result?: {
+    /** 当前套餐档位 */
+    PlanType?: PlanTier
+    AFPFiveHour?: AFPWindow
+    AFPDaily?: AFPWindow
+    AFPWeekly?: AFPWindow
+    AFPMonthly?: AFPWindow
+  }
 }
 
 const DAY = 86_400_000
@@ -33,6 +85,31 @@ const startOfDay = (ms: number): number => {
   return d.getTime()
 }
 
+async function postArk<T extends { ResponseMetadata?: ArkResponseMetadata }>(
+  action: string,
+  config: ProviderConfig,
+  body: string
+): Promise<T> {
+  const signed = signVolc({
+    method: 'POST',
+    url: `${ENDPOINT}/?Action=${action}&Version=2024-01-01`,
+    acsHeaders: {},
+    body,
+    region: REGION,
+    service: SERVICE,
+    accessKeyId: config.accessKeyId,
+    accessKeySecret: config.secretAccessKey
+  })
+  const json = await requestJson<T>(signed.url, {
+    method: 'POST',
+    headers: signed.headers,
+    body: signed.body
+  })
+  const err = json.ResponseMetadata?.Error
+  if (err) throw new ProviderApiError(`${err.Code}: ${err.Message}`)
+  return json
+}
+
 async function fetchUsageDetails(
   config: ProviderConfig,
   startMs: number,
@@ -42,24 +119,13 @@ async function fetchUsageDetails(
     QueryInterval: 'Day',
     Filter: { StartTime: toDateStr(startMs), EndTime: toDateStr(endMs) }
   })
-  const signed = signVolc({
-    method: 'POST',
-    url: ENDPOINT,
-    acsHeaders: {},
-    body,
-    region: REGION,
-    service: SERVICE,
-    accessKeyId: config.accessKeyId,
-    accessKeySecret: config.secretAccessKey
-  })
-  const json = await requestJson<UsageDetailsResponse>(signed.url, {
-    method: 'POST',
-    headers: signed.headers,
-    body: signed.body
-  })
-  const err = json.ResponseMetadata?.Error
-  if (err) throw new ProviderApiError(`${err.Code}: ${err.Message}`)
+  const json = await postArk<UsageDetailsResponse>('GetUsageDetails', config, body)
   return json.Result?.Details ?? []
+}
+
+async function fetchAFPUsage(config: ProviderConfig): Promise<AFPUsageResponse['Result']> {
+  const json = await postArk<AFPUsageResponse>('GetAFPUsage', config, '{}')
+  return json.Result
 }
 
 function groupByModel(
@@ -85,7 +151,7 @@ export const volcengineArkAdapter: ProviderAdapter = {
   meta: {
     id: 'volcengine-ark',
     name: '火山方舟',
-    description: '套餐用量详情（GetUsageDetails，按天统计 Tokens）',
+    description: 'Agent Plan AFP 额度（5 小时/日/周/月滚动窗口）+ 模型 Tokens 用量明细',
     fields: [
       {
         key: 'accessKeyId',
@@ -106,6 +172,14 @@ export const volcengineArkAdapter: ProviderAdapter = {
         url: 'https://console.volcengine.com/iam/keymanage/'
       },
       {
+        label: '用量明细接口 GetUsageDetails',
+        url: 'https://docs.volcengine.com/docs/82379/2479849'
+      },
+      {
+        label: 'AFP 额度接口 GetAFPUsage',
+        url: 'https://docs.volcengine.com/docs/82379/2479847'
+      },
+      {
         label: '火山方舟控制台',
         url: 'https://console.volcengine.com/ark/region:ark+cn-beijing/overview'
       }
@@ -114,7 +188,11 @@ export const volcengineArkAdapter: ProviderAdapter = {
 
   async fetchSummary(config) {
     const now = Date.now()
-    const details = await fetchUsageDetails(config, now - 30 * DAY, now)
+    // AFP 配额快照与 Token 明细并行拉取；AFP 失败（如未订阅个人版 Agent Plan）时降级为仅展示 Token 明细
+    const [afp, details] = await Promise.all([
+      fetchAFPUsage(config).catch(() => undefined),
+      fetchUsageDetails(config, now - 30 * DAY, now)
+    ])
     const models = groupByModel(details)
 
     const sumInRange = (fromMs: number): number =>
@@ -126,14 +204,39 @@ export const volcengineArkAdapter: ProviderAdapter = {
 
     const top = [...models.entries()].sort((a, b) => b[1].total - a[1].total)
 
+    const windows: [string, AFPWindow | undefined][] = [
+      ['5 小时', afp?.AFPFiveHour],
+      ['今日', afp?.AFPDaily],
+      ['本周', afp?.AFPWeekly],
+      ['本月', afp?.AFPMonthly]
+    ]
+    const afpMetrics = windows
+      .filter(([, w]) => w)
+      .map(([label, w]) => ({
+        label: `AFP · ${label}`,
+        value: fmt(w!.Used),
+        sub: `/ ${fmt(w!.Quota)}`,
+        percent: w!.Quota > 0 ? (w!.Used / w!.Quota) * 100 : undefined,
+        hint: w!.ResetTime
+          ? `重置于 ${new Date(w!.ResetTime).toLocaleString('zh-CN', { hour12: false })}`
+          : undefined
+      }))
+
+    const fallbackMetrics = [
+      { label: '近 7 天用量', value: fmt(last7), sub: unit },
+      { label: '近 30 天用量', value: fmt(last30), sub: unit },
+      { label: '模型数量', value: `${models.size}`, sub: '有用量记录的模型' }
+    ]
+
     return {
       providerId: 'volcengine-ark',
-      metrics: [
-        { label: '近 7 天用量', value: fmt(last7), sub: unit },
-        { label: '近 30 天用量', value: fmt(last30), sub: unit },
-        { label: '模型数量', value: `${models.size}`, sub: '有用量记录的模型' }
+      status: afp?.PlanType ? `个人版 Agent Plan · ${afp.PlanType}` : undefined,
+      metrics: afpMetrics.length > 0 ? afpMetrics : fallbackMetrics,
+      breakdowns: [
+        { name: '近 7 天 Tokens', used: last7, unit },
+        { name: '近 30 天 Tokens', used: last30, unit },
+        ...top.map(([name, m]) => ({ name, used: m.total, unit: m.unit }))
       ],
-      breakdowns: top.map(([name, m]) => ({ name, used: m.total, unit: m.unit })),
       updatedAt: now
     } satisfies UsageSummary
   },
@@ -141,7 +244,10 @@ export const volcengineArkAdapter: ProviderAdapter = {
   async fetchDetail(config, days) {
     const now = Date.now()
     const from = startOfDay(now - (days - 1) * DAY)
-    const details = await fetchUsageDetails(config, from, now)
+    const [afp, details] = await Promise.all([
+      fetchAFPUsage(config).catch(() => undefined),
+      fetchUsageDetails(config, from, now)
+    ])
     const models = groupByModel(details)
 
     const daysList: number[] = []
@@ -157,27 +263,83 @@ export const volcengineArkAdapter: ProviderAdapter = {
 
     const unit = details[0]?.Unit ?? 'Tokens'
 
+    const charts: DetailChart[] = []
+
+    const afpWindows: [string, AFPWindow | undefined][] = [
+      ['5 小时', afp?.AFPFiveHour],
+      ['今日', afp?.AFPDaily],
+      ['本周', afp?.AFPWeekly],
+      ['本月', afp?.AFPMonthly]
+    ]
+    const presentWindows = afpWindows.filter(([, w]) => w)
+    if (presentWindows.length > 0) {
+      charts.push({
+        id: 'afp-used',
+        title: afp?.PlanType ? `AFP 已用量（${afp.PlanType} 套餐）` : 'AFP 已用量',
+        kind: 'bar',
+        unit: 'AFP',
+        categories: presentWindows.map(([label, w]) => ({ name: label, value: w!.Used }))
+      })
+      charts.push({
+        id: 'afp-quota',
+        title: 'AFP 配额与剩余',
+        kind: 'bar',
+        unit: 'AFP',
+        categories: presentWindows.flatMap(([label, w]) => [
+          { name: `${label} 总配额`, value: w!.Quota },
+          { name: `${label} 剩余`, value: Math.max(0, w!.Quota - w!.Used) }
+        ])
+      })
+      charts.push({
+        id: 'afp-percent',
+        title: 'AFP 使用率',
+        kind: 'bar',
+        unit: '%',
+        categories: presentWindows.map(([label, w]) => ({
+          name: label,
+          value: w!.Quota > 0 ? Math.round((w!.Used / w!.Quota) * 1000) / 10 : 0
+        }))
+      })
+    }
+
+    charts.push({
+      id: 'daily-tokens',
+      title: '每日 Tokens 用量（按模型堆叠）',
+      kind: 'area',
+      unit,
+      series
+    })
+
+    charts.push({
+      id: 'model-total',
+      title: `各模型累计用量（近 ${days} 天）`,
+      kind: 'bar',
+      unit,
+      categories: [...models.entries()]
+        .sort((a, b) => b[1].total - a[1].total)
+        .map(([name, m]) => ({ name, value: m.total }))
+    })
+
+    const byBilling = new Map<string, number>()
+    for (const d of details) {
+      const label =
+        d.BillingType === 'WithinPlan' ? '套餐内' : d.BillingType === 'OutsideOfPlan' ? '套餐外' : d.BillingType
+      byBilling.set(label, (byBilling.get(label) ?? 0) + d.Usage)
+    }
+    if (byBilling.size > 0) {
+      charts.push({
+        id: 'billing',
+        title: `套餐内外用量占比（近 ${days} 天）`,
+        kind: 'pie',
+        unit,
+        categories: [...byBilling.entries()].map(([name, value]) => ({ name, value }))
+      })
+    }
+
     return {
       ranges: [7, 14, 30],
-      note: '数据来源：火山方舟 GetUsageDetails（QueryInterval=Day），含套餐内与超额用量。',
-      charts: [
-        {
-          id: 'daily-tokens',
-          title: '每日 Tokens 用量（按模型堆叠）',
-          kind: 'area',
-          unit,
-          series
-        },
-        {
-          id: 'model-total',
-          title: '各模型累计用量',
-          kind: 'bar',
-          unit,
-          categories: [...models.entries()]
-            .sort((a, b) => b[1].total - a[1].total)
-            .map(([name, m]) => ({ name, value: m.total }))
-        }
-      ]
+      note: '数据来源：GetAFPUsage（AFP 额度快照，分钟级延迟）+ GetUsageDetails（QueryInterval=Day，小时级延迟）。不同模型 AFP 与 Token 折算系数不同，两类数据不应直接互相核对。',
+      charts
     } satisfies UsageDetail
   }
 }

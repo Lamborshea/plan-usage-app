@@ -2,6 +2,7 @@ import { ipcMain, shell } from 'electron'
 import type { IpcMainInvokeEvent } from 'electron'
 import type { ProviderState, Result, UsageDetail, UsageSummary } from '../shared/types'
 import { allProviders, getProvider } from './providers'
+import type { ProviderAdapter, ProviderConfig } from './providers/types'
 import { configStore } from './store'
 import { setPopoverHeight, setPinned, isPinned, getPopover } from './windows'
 import { openStandalone } from './standalone'
@@ -14,13 +15,29 @@ function guard<T>(fn: () => Promise<T> | T): Promise<Result<T>> {
     .catch((e: Error) => ({ ok: false as const, error: e.message }))
 }
 
+/** 无密钥字段的供应商（如基于本机 CLI 的百炼）视为已配置，可拿到空配置 */
+function requireConfig(provider: ProviderAdapter): ProviderConfig {
+  const stored = configStore.get(provider.meta.id)
+  if (stored) return stored
+  if (provider.meta.fields.length === 0) return {}
+  throw new Error('尚未配置密钥，请先到设置中填写')
+}
+
 export function registerIpcHandlers(): void {
-  ipcMain.handle('providers:list', (): ProviderState[] =>
-    allProviders().map((p) => ({
-      meta: p.meta,
-      configured: configStore.isConfigured(p.meta.id)
-    }))
-  )
+  ipcMain.handle('providers:list', async (): Promise<ProviderState[]> => {
+    const states = await Promise.all(
+      allProviders().map(async (p) => ({
+        meta: p.meta,
+        // 凭证在外部体系的供应商（如百炼 CLI 登录态）用 isAvailable 判断，
+        // 其余按配置字段是否齐全判断；未配置/未登录的供应商不进入概览面板
+        configured: p.isAvailable
+          ? await p.isAvailable(configStore.get(p.meta.id) ?? {})
+          : p.meta.fields.length === 0 || configStore.isConfigured(p.meta.id),
+        canLogin: typeof p.login === 'function'
+      }))
+    )
+    return states
+  })
 
   ipcMain.handle('providers:get-config', (_e: IpcMainInvokeEvent, id: string) =>
     configStore.getForEdit(id)
@@ -42,9 +59,7 @@ export function registerIpcHandlers(): void {
     guard(async () => {
       const provider = getProvider(id)
       if (!provider) throw new Error(`未知供应商: ${id}`)
-      const config = configStore.get(id)
-      if (!config) throw new Error('尚未配置密钥，请先到设置中填写')
-      return provider.fetchSummary(config)
+      return provider.fetchSummary(requireConfig(provider))
     })
   )
 
@@ -54,9 +69,7 @@ export function registerIpcHandlers(): void {
       guard(async () => {
         const provider = getProvider(id)
         if (!provider) throw new Error(`未知供应商: ${id}`)
-        const config = configStore.get(id)
-        if (!config) throw new Error('尚未配置密钥，请先到设置中填写')
-        return provider.fetchDetail(config, days)
+        return provider.fetchDetail(requireConfig(provider), days)
       })
   )
 
@@ -65,6 +78,19 @@ export function registerIpcHandlers(): void {
       const provider = getProvider(id)
       if (!provider) throw new Error(`未知供应商: ${id}`)
       return provider.fetchSummary(values)
+    })
+  )
+
+  ipcMain.handle('providers:login', (_e: IpcMainInvokeEvent, id: string): Promise<Result<string>> =>
+    guard(async () => {
+      const provider = getProvider(id)
+      if (!provider) throw new Error(`未知供应商: ${id}`)
+      if (!provider.login) throw new Error('该供应商不支持应用内登录')
+      const message = await provider.login()
+      // 登录态变化后通知概览面板刷新
+      const popover = getPopover()
+      if (popover && !popover.isDestroyed()) popover.webContents.send('data:changed')
+      return message
     })
   )
 

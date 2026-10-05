@@ -47,7 +47,7 @@ export function cancelScheduledHide(): void {
 
 export function createTray(): Tray {
   tray = new Tray(trayIcon())
-  tray.setToolTip('Agent Usage · AI 用量监控')
+  tray.setToolTip('Plan Usage · AI 用量监控')
 
   const bounds = (): Electron.Rectangle | undefined => tray?.getBounds()
 

@@ -1,538 +1,461 @@
+import { execFile, spawn } from 'node:child_process'
+import { existsSync } from 'node:fs'
+import path from 'node:path'
+import { promisify } from 'node:util'
+import { app } from 'electron'
 import type { Breakdown, DetailChart, Metric, UsageDetail, UsageSummary } from '../../shared/types'
-import { signAcs3 } from './signing/acs3'
-import { ProviderApiError, requestJson, type ProviderAdapter, type ProviderConfig } from './types'
+import { ProviderApiError, type ProviderAdapter, type ProviderConfig } from './types'
 
-const HOST = 'https://modelstudio.cn-beijing.aliyuncs.com'
-const API_VERSION = '2026-02-10'
-/** TokenPlan 产品固定的命名空间 */
-const NAMESPACE_ID = 'namespace-1'
+const execFileAsync = promisify(execFile)
 
-const SEAT_TYPE_LABELS: Record<string, string> = {
-  standard: '标准席位',
-  pro: '高级席位',
-  max: '尊享席位'
+/* ------------------------------------------------------------------ *
+ * 百炼 Agent 套餐用量：通过官方 CLI（bl）的 Console 鉴权通道查询
+ *   - bl usage token-plan  → Token Plan 个人版（并发 Agent 套餐）5 小时 / 1 周额度
+ *   - bl usage coding-plan → Coding Plan 5 小时 / 周 / 账期额度
+ * 两者均为实时快照，返回 0-1 的小数百分比与重置时间戳（毫秒）。
+ * ------------------------------------------------------------------ */
+
+/**
+ * `bl usage token-plan --output json` 输出。
+ * 网关 API：zeldaHttp.apikeyMgr./tokenplan/personal/api/v2/usage（请求体 {}）。
+ * CLI 仅保留有限数字类型的这 4 个字段；未订阅个人版时输出 {}。
+ * 详见 docs/bailian.md《usage token-plan》。
+ */
+interface TokenPlanUsage {
+  /** 5 小时窗口额度使用比例，0–1 小数（如 0.32 = 32%） */
+  per5HourPercentage?: number
+  /** 5 小时窗口重置时间，毫秒时间戳 */
+  per5HourResetTime?: number
+  /** 1 周窗口额度使用比例，0–1 小数 */
+  per1WeekPercentage?: number
+  /** 1 周窗口重置时间，毫秒时间戳 */
+  per1WeekResetTime?: number
 }
 
-const ROLE_LABELS: Record<string, string> = {
-  ORG_OWNER: '组织拥有者',
-  ORG_ADMIN: '组织管理员',
-  WS_ADMIN: '空间管理员',
-  MEMBER: '成员'
+/**
+ * Coding Plan 单个额度窗口。
+ * 由原始字段 {前缀}UsedQuota / TotalQuota / QuotaNextRefreshTime 映射而来，
+ * 原始字段缺失则对应键省略。
+ */
+interface PlanWindow {
+  /** 本窗口已用额度（次数） */
+  usedQuota?: number
+  /** 本窗口总额度（次数） */
+  totalQuota?: number
+  /** 窗口重置时间，毫秒时间戳（原始 *QuotaNextRefreshTime） */
+  resetTime?: number
+  /** CLI 计算的 usedQuota/totalQuota，仅当两者存在且 totalQuota>0 时输出 */
+  percentage?: number
+}
+
+/**
+ * `bl usage coding-plan --output json` 输出。
+ * 网关 API：zeldaEasy.broadscope-bailian.codingPlan.queryCodingPlanInstanceInfoV2，
+ * 取 codingPlanInstanceInfos 中首个 status==='VALID' 实例的 codingPlanQuotaInfo；
+ * 无有效订阅时输出 {}。详见 docs/bailian.md《usage coding-plan》。
+ */
+interface CodingPlanUsage {
+  per5Hour?: PlanWindow
+  perWeek?: PlanWindow
+  perBillMonth?: PlanWindow
+  /** 实例规格（如 pro / max），仅当 CLI 返回非空字符串时存在 */
+  instanceType?: string
+}
+
+/**
+ * bl 失败时的错误对象。code 枚举（bailian-cli-core）：0 SUCCESS / 1 GENERAL /
+ * 2 USAGE / 3 AUTH（未登录或 Console 会话过期）/ 4 QUOTA / 5 TIMEOUT / 6 NETWORK。
+ */
+interface BlCliError {
+  code?: number
+  message?: string
+  hint?: string
 }
 
 /* ------------------------------------------------------------------ *
- * 通用请求层
+ * bl 执行器定位：优先使用随 app 分发的内置 bailian-cli（用 Electron
+ * 自带的 Node 运行时直接跑它的 ESM 入口，用户无需安装 Node 或 CLI），
+ * 找不到内置脚本时再回退系统安装的 bl（GUI 启动时 PATH 通常不含
+ * npm 全局目录，需要常见路径 + 登录 shell 兜底）。
  * ------------------------------------------------------------------ */
 
-type QueryValue = string | number | boolean | undefined | string[]
-
-interface AcsRequest {
-  action: string
-  path: string
-  query?: Record<string, QueryValue>
+interface BlLauncher {
+  cmd: string
+  /** 传给 cmd 的前置参数（内置模式下为脚本路径） */
+  prefix: string[]
+  env: NodeJS.ProcessEnv
 }
 
-function buildUrl(path: string, query?: Record<string, QueryValue>): string {
-  const u = new URL(HOST + path)
-  for (const [k, v] of Object.entries(query ?? {})) {
-    if (v === undefined) continue
-    if (Array.isArray(v)) v.forEach((item, i) => u.searchParams.append(`${k}.${i + 1}`, item))
-    else u.searchParams.append(k, String(v))
+const BL_CANDIDATES = ['bl', 'bailian', '/usr/local/bin/bl', '/opt/homebrew/bin/bl']
+
+let launcherCache: BlLauncher | null = null
+
+function blEnv(extra?: NodeJS.ProcessEnv): NodeJS.ProcessEnv {
+  return { ...process.env, NO_COLOR: '1', ...extra }
+}
+
+/** 内置 bailian-cli 入口脚本的候选路径（按可靠性排序） */
+function bundledScriptCandidates(): string[] {
+  const rel = path.join('node_modules', 'bailian-cli', 'dist', 'bailian.mjs')
+  const list: string[] = []
+  const res = process.resourcesPath
+  if (res) {
+    // asarUnpack 后的解包目录（ESM 无法从 asar 内加载，必须走 unpacked）
+    list.push(path.join(res, 'app.asar.unpacked', rel))
+    // 关闭 asar 打包时的常规目录
+    list.push(path.join(res, 'app', rel))
   }
-  return u.toString()
-}
-
-async function callAcs<T>(config: ProviderConfig, req: AcsRequest): Promise<T> {
-  const signed = signAcs3({
-    method: 'GET',
-    url: buildUrl(req.path, req.query),
-    acsHeaders: { 'x-acs-action': req.action, 'x-acs-version': API_VERSION },
-    accessKeyId: config.accessKeyId,
-    accessKeySecret: config.accessKeySecret
-  })
-  return requestJson<T>(signed.url, { method: 'GET', headers: signed.headers })
-}
-
-/* ------------------------------------------------------------------ *
- * 响应结构
- * TokenPlan 系列接口用 PascalCase（Success/Data），账单系列用 camelCase。
- * ------------------------------------------------------------------ */
-
-interface SubscriptionStatsResponse {
-  Success: boolean
-  Code?: string
-  Message?: string
-  Data?: {
-    SubscriptionStartTime: number
-    SubscriptionEndTime: number
-    Items?: {
-      SeatType: string
-      SeatRefreshTime: number
-      TotalSeats: number
-      AssignedSeats: number
-      SeatCredits: number
-      SeatRemainingCredits: number
-    }[]
+  try {
+    // 开发模式：appPath 即项目根目录
+    list.push(path.join(app.getAppPath(), rel))
+  } catch {
+    /* app 未 ready 时 getAppPath 也可用，这里只是防御 */
   }
+  return list
 }
 
-interface SeatDetailsResponse {
-  Success: boolean
-  Data?: {
-    Total?: number
-    Items?: {
-      SeatId?: string
-      SpecType?: string
-      AssignedStatus?: string
-      Status?: string
-      StartTime?: number
-      EndTime?: number
-      EquityList?: {
-        EquityType?: string
-        CycleStartTime?: number
-        CycleEndTime?: number
-        CycleTotalValue?: number
-        CycleSurplusValue?: number
-      }[]
-    }[]
-  }
-}
-
-interface AccountResponse {
-  Success: boolean
-  Data?: {
-    AccountId?: string
-    Name?: string
-    OrgMemberships?: { OrgId?: string; RoleCode?: string; MemberStatus?: string }[]
-  }
-}
-
-interface MemberSeatResponse {
-  Success?: boolean
-  OrgId?: string
-  TotalMemberCount?: number
-  SeatedMemberCount?: number
-  UnseatedMemberCount?: number
-}
-
-interface Money {
-  amount?: string
-  pretaxAmount?: string
-  totalAmount?: string
-  currency?: string
-}
-interface DimValue extends Money {
-  name?: string
-  key?: string
-}
-
-interface BillingOverviewResponse {
-  success: boolean
-  data?: Money & { groups?: DimValue[] }
-}
-
-interface BillingTrendResponse {
-  success: boolean
-  data?: {
-    resultByTime?: { period?: string; total?: Money; periodDetails?: DimValue[] }[]
-  }
-}
-
-/* ------------------------------------------------------------------ *
- * 工具函数
- * ------------------------------------------------------------------ */
-
-const num = (v: string | number | undefined): number => {
-  const n = typeof v === 'number' ? v : Number(v)
-  return Number.isFinite(n) ? n : 0
-}
-
-const seatLabel = (t?: string): string => (t ? (SEAT_TYPE_LABELS[t] ?? t) : '未分类')
-
-const fmtDate = (ms: number): string => new Date(ms).toLocaleString('zh-CN', { hour12: false })
-
-const fmtMoney = (v: number, currency = 'CNY'): string =>
-  `${currency === 'CNY' ? '¥' : ''}${v.toLocaleString('zh-CN', { maximumFractionDigits: 2 })}`
-
-const ymd = (d: Date): string =>
-  `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`
-
-/** '20261003' -> 当天 00:00 的时间戳 */
-const parsePeriod = (p: string): number => {
-  const y = Number(p.slice(0, 4))
-  const m = Number(p.slice(4, 6)) - 1
-  const day = Number(p.slice(6, 8)) || 1
-  return new Date(y, m, day).getTime()
-}
-
-/** 账单接口要求时间区间不能跨月，按自然月切段 */
-function monthSegments(startMs: number, endMs: number): { start: string; end: string }[] {
-  const segs: { start: string; end: string }[] = []
-  const end = new Date(endMs)
-  const cur = new Date(startMs)
-  cur.setHours(0, 0, 0, 0)
-  while (cur <= end) {
-    const monthLast = new Date(cur.getFullYear(), cur.getMonth() + 1, 0)
-    const segEnd = monthLast < end ? monthLast : end
-    segs.push({ start: ymd(cur), end: ymd(segEnd) })
-    cur.setMonth(cur.getMonth() + 1, 1)
-  }
-  return segs
-}
-
-const monthsIn = (startMs: number, endMs: number): string[] => {
-  const out: string[] = []
-  const cur = new Date(startMs)
-  const end = new Date(endMs)
-  while (cur <= end && out.length < 12) {
-    out.push(`${cur.getFullYear()}-${String(cur.getMonth() + 1).padStart(2, '0')}`)
-    cur.setMonth(cur.getMonth() + 1, 1)
-  }
-  return out
-}
-
-const thisMonthKey = (): string => {
-  const d = new Date()
-  return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}`
-}
-
-const lastMonthKey = (): string => {
-  const d = new Date()
-  d.setDate(1)
-  d.setMonth(d.getMonth() - 1)
-  return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}`
-}
-
-/* ------------------------------------------------------------------ *
- * 数据采集：团队版席位 + 个人版账单，能取到多少算多少
- * ------------------------------------------------------------------ */
-
-interface Snapshot {
-  stats?: SubscriptionStatsResponse['Data']
-  seats?: SeatDetailsResponse['Data']
-  account?: AccountResponse['Data']
-  member?: MemberSeatResponse
-  curMonth?: BillingOverviewResponse['data']
-  prevMonth?: BillingOverviewResponse['data']
-  /** 全部接口都失败时才有的错误 */
-  failures: string[]
-}
-
-async function collect(config: ProviderConfig): Promise<Snapshot> {
-  const failures: string[] = []
-  const pick = <T>(r: PromiseSettledResult<T>, label: string): T | undefined => {
-    if (r.status === 'fulfilled') return r.value
-    failures.push(`${label}: ${r.reason instanceof Error ? r.reason.message : String(r.reason)}`)
-    return undefined
-  }
-
-  const [statsR, seatsR, accountR, memberR, curR, prevR] = await Promise.allSettled([
-    callAcs<SubscriptionStatsResponse>(config, { action: 'GetSubscriptionStats', path: '/tokenplan/subscription/stats' }),
-    callAcs<SeatDetailsResponse>(config, {
-      action: 'GetSubscriptionSeatDetails',
-      path: '/tokenplan/subscription/seat-detail',
-      query: { NamespaceId: NAMESPACE_ID, PageNo: 1, PageSize: 100, StatusList: ['NORMAL'] }
-    }),
-    callAcs<AccountResponse>(config, { action: 'GetTokenPlanAccountDetail', path: '/tokenplan/account' }),
-    callAcs<MemberSeatResponse>(config, { action: 'GetOrganizationMemberSeatStats', path: '/tokenplan/organization/member-seat-stats' }),
-    callAcs<BillingOverviewResponse>(config, {
-      action: 'GetBillingOverview',
-      path: '/modelstudio/billing/overview',
-      query: { billMonth: thisMonthKey(), groupBy: JSON.stringify([{ code: 'BASE_MODEL' }]), topNum: 20, zeroFilter: false, locale: 'zh-CN' }
-    }),
-    callAcs<BillingOverviewResponse>(config, {
-      action: 'GetBillingOverview',
-      path: '/modelstudio/billing/overview',
-      query: { billMonth: lastMonthKey(), groupBy: JSON.stringify([{ code: 'BASE_MODEL' }]), topNum: 20, zeroFilter: false, locale: 'zh-CN' }
+async function canRun(launcher: BlLauncher): Promise<boolean> {
+  try {
+    await execFileAsync(launcher.cmd, [...launcher.prefix, '--version'], {
+      timeout: 10_000,
+      env: launcher.env
     })
-  ])
-
-  const stats = pick(statsR, 'GetSubscriptionStats')?.Data
-  const seats = pick(seatsR, 'GetSubscriptionSeatDetails')?.Data
-  const account = pick(accountR, 'GetTokenPlanAccountDetail')?.Data
-  const member = pick(memberR, 'GetOrganizationMemberSeatStats')
-  const curMonth = pick(curR, 'GetBillingOverview(本月)')?.data
-  const prevMonth = pick(prevR, 'GetBillingOverview(上月)')?.data
-
-  if (failures.length >= 6) throw new ProviderApiError(failures[0] ?? '所有接口调用失败')
-
-  return { stats, seats, account, member, curMonth, prevMonth, failures }
-}
-
-/** 团队版 Credits：优先用聚合接口，缺失时按席位明细汇总 */
-function teamCredits(s: Snapshot) {
-  const items = s.stats?.Items ?? []
-  if (items.length) {
-    const totalCredits = items.reduce((a, i) => a + num(i.SeatCredits), 0)
-    const remainingCredits = items.reduce((a, i) => a + num(i.SeatRemainingCredits), 0)
-    return {
-      from: 'stats' as const,
-      totalCredits,
-      remainingCredits,
-      usedCredits: totalCredits - remainingCredits,
-      totalSeats: items.reduce((a, i) => a + num(i.TotalSeats), 0),
-      assignedSeats: items.reduce((a, i) => a + num(i.AssignedSeats), 0),
-      breakdowns: items.map<Breakdown>((i) => ({
-        name: seatLabel(i.SeatType),
-        used: num(i.SeatCredits) - num(i.SeatRemainingCredits),
-        total: num(i.SeatCredits),
-        unit: 'Credits'
-      }))
-    }
-  }
-
-  const seats = s.seats?.Items ?? []
-  if (!seats.length) return undefined
-  const creditSeats = seats.filter((x) => (x.EquityList ?? []).length)
-  let totalCredits = 0
-  let remainingCredits = 0
-  const byType = new Map<string, { used: number; total: number }>()
-  for (const seat of creditSeats) {
-    for (const e of seat.EquityList ?? []) {
-      const total = num(e.CycleTotalValue)
-      const surplus = num(e.CycleSurplusValue)
-      totalCredits += total
-      remainingCredits += surplus
-      const key = seatLabel(seat.SpecType)
-      const acc = byType.get(key) ?? { used: 0, total: 0 }
-      acc.used += total - surplus
-      acc.total += total
-      byType.set(key, acc)
-    }
-  }
-  return {
-    from: 'seats' as const,
-    totalCredits,
-    remainingCredits,
-    usedCredits: totalCredits - remainingCredits,
-    totalSeats: seats.length,
-    assignedSeats: seats.filter((x) => x.AssignedStatus === 'ASSIGNED' || x.AssignedStatus === 'true').length,
-    breakdowns: [...byType.entries()].map<Breakdown>(([name, v]) => ({ name, used: v.used, total: v.total, unit: 'Credits' }))
+    return true
+  } catch {
+    return false
   }
 }
 
-const currencyOf = (s: Snapshot): string => s.curMonth?.currency ?? s.prevMonth?.currency ?? 'CNY'
-
-function throwIfNoData(s: Snapshot): void {
-  if (s.stats?.Items?.length || s.seats?.Items?.length || s.member?.OrgId || s.curMonth || s.prevMonth) return
+async function resolveLauncher(): Promise<BlLauncher> {
+  if (launcherCache) return launcherCache
+  // 1) 内置 CLI：用 Electron 自带的 Node 运行时执行打包进来的 mjs
+  const script = bundledScriptCandidates().find((p) => existsSync(p))
+  if (script) {
+    const launcher: BlLauncher = {
+      cmd: process.execPath,
+      prefix: [script],
+      env: blEnv({ ELECTRON_RUN_AS_NODE: '1' })
+    }
+    if (await canRun(launcher)) {
+      launcherCache = launcher
+      return launcher
+    }
+  }
+  // 2) 系统安装的 bl
+  for (const c of BL_CANDIDATES) {
+    const launcher: BlLauncher = { cmd: c, prefix: [], env: blEnv() }
+    if (await canRun(launcher)) {
+      launcherCache = launcher
+      return launcher
+    }
+  }
+  // 3) 回退：借登录 shell 解析用户 PATH（nvm 等版本管理器在此生效）
+  try {
+    const { stdout } = await execFileAsync(
+      '/bin/zsh',
+      ['-lc', 'command -v bl || command -v bailian'],
+      { timeout: 10_000 }
+    )
+    const p = stdout.trim().split('\n').pop() ?? ''
+    if (p) {
+      const launcher: BlLauncher = { cmd: p, prefix: [], env: blEnv() }
+      if (await canRun(launcher)) {
+        launcherCache = launcher
+        return launcher
+      }
+    }
+  } catch {
+    /* 忽略，走统一报错 */
+  }
   throw new ProviderApiError(
-    '接口调用成功，但该账号名下没有 Token Plan 用量数据。' +
-      '个人版（Solo）订阅的 Credits 额度未开放 OpenAPI，' +
-      '请在控制台「我的订阅」查看；若为团队版，请确认已订阅席位，并给该 AccessKey 授予 AliyunTokenPlanReadOnlyAccess、AliyunBSSReadOnlyAccess。'
+    '百炼 CLI 不可用：安装包中未找到内置 CLI，系统也未安装。请重新安装应用，或在终端执行: npm install -g bailian-cli'
   )
 }
 
+/** 执行 bl 子命令并解析 JSON 输出 */
+async function runBl(args: string[]): Promise<Record<string, unknown>> {
+  const launcher = await resolveLauncher()
+  let stdout = ''
+  let stderr = ''
+  try {
+    const r = await execFileAsync(launcher.cmd, [...launcher.prefix, ...args], {
+      timeout: 60_000,
+      env: launcher.env
+    })
+    stdout = r.stdout
+    stderr = r.stderr
+  } catch (e) {
+    const err = e as { stdout?: string; stderr?: string; message?: string }
+    stdout = err.stdout ?? ''
+    stderr = err.stderr ?? ''
+  }
+  const text = (stdout || stderr).trim()
+  let json: Record<string, unknown>
+  try {
+    json = JSON.parse(text) as Record<string, unknown>
+  } catch {
+    throw new ProviderApiError(`百炼 CLI 输出解析失败: ${text || '（无输出）'}`)
+  }
+  const cliErr = json.error as BlCliError | undefined
+  if (cliErr) {
+    if (cliErr.code === 3 || /console access token|not authenticated/i.test(cliErr.message ?? '')) {
+      throw new ProviderApiError('百炼未登录控制台，请点击下方「登录百炼」完成授权')
+    }
+    const hint = cliErr.hint ? `（${cliErr.hint}）` : ''
+    throw new ProviderApiError(`百炼 CLI: ${cliErr.message ?? '未知错误'}${hint}`)
+  }
+  return json
+}
+
+/**
+ * 拉起控制台 OAuth 登录（浏览器授权，本地端口回调）。
+ * bl 为非交互命令：打开浏览器后等待回调，exit 0 即登录成功。
+ */
+async function loginConsole(): Promise<string> {
+  const launcher = await resolveLauncher()
+  return new Promise<string>((resolve, reject) => {
+    const child = spawn(launcher.cmd, [...launcher.prefix, 'auth', 'login', '--console'], {
+      env: launcher.env
+    })
+    let output = ''
+    child.stdout?.on('data', (d) => (output += String(d)))
+    child.stderr?.on('data', (d) => (output += String(d)))
+    const timer = setTimeout(() => {
+      child.kill()
+      reject(new ProviderApiError('百炼登录超时（5 分钟），请在浏览器完成授权后重试'))
+    }, 300_000)
+    child.on('error', (e) => {
+      clearTimeout(timer)
+      reject(new ProviderApiError(`无法启动百炼登录: ${e.message}`))
+    })
+    child.on('exit', (code) => {
+      clearTimeout(timer)
+      if (code === 0) {
+        resolve('登录成功')
+      } else {
+        const detail = output.trim()
+        reject(
+          new ProviderApiError(
+            `百炼登录失败（退出码 ${code}）${detail ? `: ${detail.slice(0, 200)}` : ''}`
+          )
+        )
+      }
+    })
+  })
+}
+
 /* ------------------------------------------------------------------ *
- * 适配器
+ * 采集两类套餐用量；某个套餐不存在时静默跳过，全部为空才报错
+ * ------------------------------------------------------------------ */
+
+interface PlanUsage {
+  token: TokenPlanUsage | null
+  coding: CodingPlanUsage | null
+}
+
+const isBlank = (o: Record<string, unknown>): boolean => Object.keys(o).length === 0
+
+function hasWindow(c: CodingPlanUsage): boolean {
+  return Boolean(c.per5Hour || c.perWeek || c.perBillMonth)
+}
+
+async function collect(_config: ProviderConfig): Promise<PlanUsage> {
+  const [tp, cp] = await Promise.allSettled([
+    runBl(['usage', 'token-plan', '--output', 'json']),
+    runBl(['usage', 'coding-plan', '--output', 'json'])
+  ])
+  // 鉴权/环境问题两边一致，任一失败即透出，避免静默吞掉真实错误
+  const fatal = (r: PromiseRejectedResult): never => {
+    throw r.reason instanceof ProviderApiError
+      ? r.reason
+      : new ProviderApiError(`百炼用量查询失败: ${(r.reason as Error).message}`)
+  }
+  let token: TokenPlanUsage | null = null
+  let coding: CodingPlanUsage | null = null
+  const tpErr = tp.status === 'rejected' ? tp : null
+  const cpErr = cp.status === 'rejected' ? cp : null
+  if (tpErr && cpErr) fatal(tpErr)
+  if (tp.status === 'fulfilled' && !isBlank(tp.value)) token = tp.value as TokenPlanUsage
+  if (cp.status === 'fulfilled' && !isBlank(cp.value) && hasWindow(cp.value as CodingPlanUsage)) {
+    coding = cp.value as CodingPlanUsage
+  }
+  if (!token && !coding) {
+    // 只剩一个接口成功时，透出另一个的真实错误
+    if (tpErr) fatal(tpErr)
+    if (cpErr) fatal(cpErr)
+    throw new ProviderApiError('当前账号未查询到 Token Plan / Coding Plan 套餐用量')
+  }
+  return { token, coding }
+}
+
+/* ------------------------------------------------------------------ *
+ * 展示辅助
+ * ------------------------------------------------------------------ */
+
+const pct = (fraction: number | undefined): number | undefined =>
+  fraction === undefined ? undefined : Math.round(fraction * 1000) / 10
+
+const hasQuota = (u: TokenPlanUsage | null): boolean =>
+  Boolean(u && (u.per5HourPercentage !== undefined || u.per1WeekPercentage !== undefined))
+
+function fmtReset(ms: number | undefined): string | undefined {
+  if (ms === undefined || !Number.isFinite(ms)) return undefined
+  return `重置于 ${new Date(ms).toLocaleString('zh-CN', { hour12: false })}`
+}
+
+const V = (n: number): string => n.toLocaleString('zh-CN')
+
+function windowMetric(label: string, w: PlanWindow): Metric {
+  const used = w.usedQuota
+  const total = w.totalQuota
+  const m: Metric = {
+    label,
+    value:
+      used !== undefined && total !== undefined
+        ? `${V(used)} / ${V(total)}`
+        : pct(w.percentage) !== undefined
+          ? `${pct(w.percentage)}%`
+          : '—',
+    percent: pct(w.percentage),
+    sub: fmtReset(w.resetTime)
+  }
+  return m
+}
+
+function planLabels(u: PlanUsage): string {
+  const parts: string[] = []
+  if (hasQuota(u.token)) parts.push('Token Plan')
+  if (u.coding) parts.push(`Coding Plan${u.coding.instanceType ? ` (${u.coding.instanceType})` : ''}`)
+  return parts.join(' · ')
+}
+
+/* ------------------------------------------------------------------ *
+ * Provider 适配器
  * ------------------------------------------------------------------ */
 
 export const aliyunBailianAdapter: ProviderAdapter = {
   meta: {
     id: 'aliyun-bailian',
     name: '阿里云百炼',
-    description: 'Token Plan 团队版席位 Credits + 模型账单消费统计',
-    fields: [
-      {
-        key: 'accessKeyId',
-        label: 'AccessKey ID',
-        type: 'text',
-        placeholder: 'LTAI5t…',
-        description: '需具备 AliyunTokenPlanReadOnlyAccess 与 AliyunBSSReadOnlyAccess 权限'
-      },
-      {
-        key: 'accessKeySecret',
-        label: 'AccessKey Secret',
-        type: 'password',
-        placeholder: '••••••••'
-      }
-    ],
+    description:
+      '查询百炼 Agent 套餐（Token Plan 个人版 / Coding Plan）的实时额度用量。已内置官方百炼 CLI，无需单独安装；首次使用点击「登录百炼」完成控制台授权即可。',
+    fields: [],
     links: [
-      { label: '获取 AccessKey（RAM 控制台）', url: 'https://ram.console.aliyun.com/manage/ak' },
-      { label: 'Token Plan 我的订阅（控制台）', url: 'https://bailian.console.aliyun.com/cn-beijing/subscription/token-plan' },
-      { label: '订阅席位接口 GetSubscriptionStats', url: 'https://api.aliyun.com/api/ModelStudio/2026-02-10/GetSubscriptionStats' },
-      { label: '账单概览接口 GetBillingOverview', url: 'https://api.aliyun.com/api/ModelStudio/2026-02-10/GetBillingOverview' }
+      { label: '百炼 CLI 安装文档', url: 'https://bailian.aliyun.com/cli/install.md' },
+      { label: '百炼控制台', url: 'https://bailian.console.aliyun.com/' }
     ]
   },
 
-  async fetchSummary(config) {
-    const s = await collect(config)
-    const team = teamCredits(s)
-    if (!team) throwIfNoData(s)
+  login: loginConsole,
 
-    const currency = currencyOf(s)
-    const cur = num(s.curMonth?.totalAmount ?? s.curMonth?.amount)
-    const prev = num(s.prevMonth?.totalAmount ?? s.prevMonth?.amount)
+  /** 百炼凭证由 CLI 管理（~/.bailian），以控制台登录态判断可用性 */
+  async isAvailable() {
+    try {
+      const status = await runBl(['auth', 'status', '--output', 'json'])
+      const consoleAuth = status.console as { source?: string } | undefined
+      return Boolean(consoleAuth?.source)
+    } catch {
+      return false
+    }
+  },
+
+  async fetchSummary(config: ProviderConfig): Promise<UsageSummary> {
+    const usage = await collect(config)
     const metrics: Metric[] = []
+    const breakdowns: Breakdown[] = []
 
-    if (team) {
+    if (hasQuota(usage.token)) {
+      const t = usage.token as TokenPlanUsage
       metrics.push(
         {
-          label: 'Credits 额度',
-          value: team.usedCredits.toLocaleString(),
-          sub: `/ ${team.totalCredits.toLocaleString()}`,
-          percent: team.totalCredits ? (team.usedCredits / team.totalCredits) * 100 : 0,
-          hint: `剩余 ${team.remainingCredits.toLocaleString()} Credits`
+          label: 'Token Plan · 5 小时用量',
+          value: pct(t.per5HourPercentage) !== undefined ? `${pct(t.per5HourPercentage)}%` : '—',
+          percent: pct(t.per5HourPercentage),
+          sub: fmtReset(t.per5HourResetTime)
         },
         {
-          label: '席位分配',
-          value: `${team.assignedSeats}`,
-          sub: `/ ${team.totalSeats}`,
-          percent: team.totalSeats ? (team.assignedSeats / team.totalSeats) * 100 : 0
+          label: 'Token Plan · 1 周用量',
+          value: pct(t.per1WeekPercentage) !== undefined ? `${pct(t.per1WeekPercentage)}%` : '—',
+          percent: pct(t.per1WeekPercentage),
+          sub: fmtReset(t.per1WeekResetTime)
         }
       )
-      if (s.stats) {
-        const remainDays = Math.max(0, Math.ceil((s.stats.SubscriptionEndTime - Date.now()) / 86_400_000))
-        metrics.push({ label: '订阅剩余', value: `${remainDays} 天`, sub: fmtDate(s.stats.SubscriptionEndTime) })
+      if (t.per5HourPercentage !== undefined) {
+        breakdowns.push({ name: 'Token Plan 5 小时窗口', used: pct(t.per5HourPercentage) as number, total: 100, unit: '%' })
+      }
+      if (t.per1WeekPercentage !== undefined) {
+        breakdowns.push({ name: 'Token Plan 1 周窗口', used: pct(t.per1WeekPercentage) as number, total: 100, unit: '%' })
       }
     }
 
-    metrics.push({
-      label: '本月消费',
-      value: fmtMoney(cur, currency),
-      sub: `上月 ${fmtMoney(prev, currency)}`,
-      percent: prev > 0 ? Math.min(100, (cur / prev) * 100) : undefined
-    })
-
-    const role = s.account?.OrgMemberships?.[0]?.RoleCode
-    if (role) metrics.push({ label: '组织角色', value: ROLE_LABELS[role] ?? role })
-
-    const breakdowns: Breakdown[] = team?.breakdowns ?? []
-    const groups = (s.curMonth?.groups ?? []).filter((g) => num(g.amount) > 0)
-    if (groups.length) {
-      breakdowns.push(
-        ...groups.map<Breakdown>((g) => ({
-          name: g.name && g.name !== '-' ? g.name : '套餐/未分类',
-          used: num(g.amount),
-          total: cur || undefined,
-          unit: currency
-        }))
-      )
+    if (usage.coding) {
+      const c = usage.coding
+      const windows: [string, PlanWindow | undefined][] = [
+        ['Coding Plan · 5 小时', c.per5Hour],
+        ['Coding Plan · 每周', c.perWeek],
+        ['Coding Plan · 本账期', c.perBillMonth]
+      ]
+      for (const [label, w] of windows) {
+        if (!w) continue
+        metrics.push(windowMetric(label, w))
+        if (w.usedQuota !== undefined && w.totalQuota !== undefined) {
+          breakdowns.push({ name: label, used: w.usedQuota, total: w.totalQuota, unit: '次' })
+        }
+      }
     }
-    if (!breakdowns.length && s.member?.OrgId) {
-      breakdowns.push({ name: '已分配席位成员', used: num(s.member.SeatedMemberCount), total: num(s.member.TotalMemberCount), unit: '人' })
-    }
-    if (!metrics.length) throwIfNoData(s)
 
-    const status = s.account?.OrgMemberships?.[0]?.MemberStatus
     return {
       providerId: 'aliyun-bailian',
-      status: status === 'ACTIVE' ? '生效中' : status ?? (team ? '生效中' : undefined),
-      period: s.stats ? { startMs: s.stats.SubscriptionStartTime, endMs: s.stats.SubscriptionEndTime } : undefined,
+      status: planLabels(usage),
       metrics,
       breakdowns,
       updatedAt: Date.now()
-    } satisfies UsageSummary
+    }
   },
 
-  async fetchDetail(config, days) {
-    const s = await collect(config)
-    const team = teamCredits(s)
-    if (!team) throwIfNoData(s)
-
+  async fetchDetail(config: ProviderConfig, _days: number): Promise<UsageDetail> {
+    const usage = await collect(config)
     const charts: DetailChart[] = []
-    const currency = currencyOf(s)
 
-    if (team) {
-      charts.push(
-        {
-          id: 'credits-used',
-          title: '各席位类型 Credits 使用',
-          kind: 'bar',
-          unit: 'Credits',
-          categories: team.breakdowns.map((b) => ({ name: b.name, value: b.used }))
-        },
-        {
-          id: 'credits-remaining',
-          title: '各席位类型剩余 Credits',
-          kind: 'pie',
-          unit: 'Credits',
-          categories:
-            team.from === 'seats'
-              ? (s.seats?.Items ?? []).map((seat) => ({
-                  name: seatLabel(seat.SpecType),
-                  value: (seat.EquityList ?? []).reduce((a, e) => a + num(e.CycleSurplusValue), 0)
-                }))
-              : (s.stats?.Items ?? []).map((i) => ({ name: seatLabel(i.SeatType), value: num(i.SeatRemainingCredits) }))
-        }
-      )
+    const rateCats: { name: string; value: number }[] = []
+    if (hasQuota(usage.token)) {
+      const t = usage.token as TokenPlanUsage
+      if (t.per5HourPercentage !== undefined) rateCats.push({ name: 'TP 5小时', value: pct(t.per5HourPercentage) as number })
+      if (t.per1WeekPercentage !== undefined) rateCats.push({ name: 'TP 每周', value: pct(t.per1WeekPercentage) as number })
     }
-
-    // 按天消费趋势（账单接口不能跨月，按月分段后合并）
-    const endMs = Date.now()
-    const startMs = endMs - (Math.max(1, days) - 1) * 86_400_000
-    const segs = monthSegments(startMs, endMs)
-    const trends = await Promise.allSettled(
-      segs.map((seg) =>
-        callAcs<BillingTrendResponse>(config, {
-          action: 'GetBillingTrend',
-          path: '/modelstudio/billing/trend',
-          query: {
-            granularity: 'DAY',
-            timePeriod: JSON.stringify({ start: seg.start, end: seg.end }),
-            groupBy: JSON.stringify([{ code: 'BASE_MODEL' }]),
-            topNum: 20,
-            zeroFilter: false,
-            locale: 'zh-CN'
-          }
-        })
-      )
-    )
-
-    const daily: { t: number; v: number }[] = []
-    const byModel = new Map<string, number>()
-    for (const r of trends) {
-      if (r.status !== 'fulfilled') continue
-      for (const row of r.value.data?.resultByTime ?? []) {
-        if (!row.period) continue
-        const t = parsePeriod(row.period)
-        daily.push({ t, v: num(row.total?.amount) })
-        for (const d of row.periodDetails ?? []) {
-          const name = d.name && d.name !== '-' ? d.name : '套餐/未分类'
-          byModel.set(name, (byModel.get(name) ?? 0) + num(d.amount))
-        }
+    if (usage.coding) {
+      const c = usage.coding
+      const entries: [string, PlanWindow | undefined][] = [
+        ['CP 5小时', c.per5Hour],
+        ['CP 每周', c.perWeek],
+        ['CP 账期', c.perBillMonth]
+      ]
+      for (const [name, w] of entries) {
+        if (w && pct(w.percentage) !== undefined) rateCats.push({ name, value: pct(w.percentage) as number })
       }
     }
-    daily.sort((a, b) => a.t - b.t)
-
-    if (daily.length) {
-      charts.push({ id: 'billing-daily', title: '按天消费趋势', kind: 'area', unit: currency, series: [{ name: '消费', points: daily }] })
-    }
-    if (byModel.size) {
-      charts.push({
-        id: 'billing-model',
-        title: '模型/计费项消费占比',
-        kind: 'pie',
-        unit: currency,
-        categories: [...byModel.entries()].map(([name, value]) => ({ name, value }))
-      })
+    if (rateCats.length > 0) {
+      charts.push({ id: 'plan-window-usage-rate', title: '套餐额度使用率（当前周期）', kind: 'bar', unit: '%', categories: rateCats })
     }
 
-    const monthKeys = monthsIn(startMs, endMs)
-    const overviews = await Promise.allSettled(
-      monthKeys.map((billMonth) =>
-        callAcs<BillingOverviewResponse>(config, {
-          action: 'GetBillingOverview',
-          path: '/modelstudio/billing/overview',
-          query: { billMonth, groupBy: JSON.stringify([{ code: 'BASE_MODEL' }]), topNum: 20, zeroFilter: false, locale: 'zh-CN' }
-        })
-      )
-    )
-    const monthly = monthKeys
-      .map((m, i) => {
-        const r = overviews[i]
-        const amount = r.status === 'fulfilled' ? num(r.value.data?.totalAmount ?? r.value.data?.amount) : 0
-        return { name: m, value: amount }
-      })
-      .filter((x) => x.value > 0)
-    if (monthly.length) charts.push({ id: 'billing-monthly', title: '月度消费对比', kind: 'bar', unit: currency, categories: monthly })
+    if (usage.coding) {
+      const quotaCats: { name: string; value: number }[] = []
+      const entries: [string, PlanWindow | undefined][] = [
+        ['5 小时', usage.coding.per5Hour],
+        ['每周', usage.coding.perWeek],
+        ['本账期', usage.coding.perBillMonth]
+      ]
+      for (const [name, w] of entries) {
+        if (w?.usedQuota !== undefined) quotaCats.push({ name, value: w.usedQuota as number })
+      }
+      if (quotaCats.length > 0) {
+        charts.push({ id: 'coding-plan-used-quota', title: 'Coding Plan 已用额度', kind: 'bar', unit: '次', categories: quotaCats })
+      }
+    }
 
-    if (!charts.length) throwIfNoData(s)
-
-    const notes: string[] = []
-    if (s.stats) notes.push(`订阅周期：${fmtDate(s.stats.SubscriptionStartTime)} → ${fmtDate(s.stats.SubscriptionEndTime)}；Credits 按席位周期刷新。`)
-    else if (team) notes.push('Credits 按席位周期统计（来自席位明细接口）。')
-    if (!team) notes.push('个人版 Credits 未开放 OpenAPI，以下金额为账单接口返回的实际消费。')
-
-    return { ranges: [7, 30, 90], note: notes.join(' '), charts } satisfies UsageDetail
+    return {
+      charts,
+      note: '百炼 CLI 提供当前套餐周期的实时额度快照，额度按窗口自动重置，暂无历史趋势数据。'
+    }
   }
 }

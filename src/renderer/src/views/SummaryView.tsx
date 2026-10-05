@@ -17,6 +17,7 @@ interface Props {
 export function SummaryView({ onOpenDetail, onOpenSettings }: Props): JSX.Element {
   const [providers, setProviders] = useState<ProviderState[]>([])
   const [slots, setSlots] = useState<Record<string, SummarySlot>>({})
+  const [loggingIn, setLoggingIn] = useState<Record<string, boolean>>({})
 
   const refresh = useCallback(async (id: string) => {
     setSlots((s) => ({ ...s, [id]: { ...s[id], loading: true, error: undefined } }))
@@ -27,16 +28,30 @@ export function SummaryView({ onOpenDetail, onOpenSettings }: Props): JSX.Elemen
     }))
   }, [])
 
+  const login = useCallback(
+    async (id: string) => {
+      setLoggingIn((s) => ({ ...s, [id]: true }))
+      const res = await api.loginProvider(id)
+      setLoggingIn((s) => ({ ...s, [id]: false }))
+      if (res.ok) void refresh(id)
+      else
+        setSlots((s) => ({
+          ...s,
+          [id]: { ...s[id], loading: false, summary: s[id]?.summary, error: res.error }
+        }))
+    },
+    [refresh]
+  )
+
   useEffect(() => {
     let alive = true
     const load = async (): Promise<void> => {
       const list = await api.listProviders()
       if (!alive) return
-      setProviders(list)
-      for (const p of list) {
-        if (p.configured) void refresh(p.meta.id)
-        else setSlots((s) => ({ ...s, [p.meta.id]: { loading: false } }))
-      }
+      // 仅展示已成功配置密钥的供应商
+      const configured = list.filter((p) => p.configured)
+      setProviders(configured)
+      for (const p of configured) void refresh(p.meta.id)
     }
     void load()
     // 配置保存后主进程广播 data:changed，重新拉取
@@ -48,49 +63,55 @@ export function SummaryView({ onOpenDetail, onOpenSettings }: Props): JSX.Elemen
 
   return (
     <div className="view">
-      {providers.length === 0 && <div className="empty">暂无供应商</div>}
+      {providers.length === 0 && (
+        <section className="card">
+          <div className="card-body muted-row">
+            尚未配置任何供应商
+            <button className="link-btn" onClick={onOpenSettings}>
+              去配置
+            </button>
+          </div>
+        </section>
+      )}
       {providers.map((p) => {
         const slot = slots[p.meta.id]
         return (
           <section className="card" key={p.meta.id}>
             <header className="card-head">
               <span className="card-title">{p.meta.name}</span>
-              {p.configured ? (
-                <span className="badge badge-ok">已配置</span>
-              ) : (
-                <span className="badge badge-warn">未配置</span>
-              )}
               <span className="spacer" />
-              {p.configured && (
-                <button
-                  className="icon-btn"
-                  title="刷新"
-                  onClick={(e) => {
-                    e.stopPropagation()
-                    void refresh(p.meta.id)
-                  }}
-                >
-                  <span className={slot?.loading ? 'spin' : ''}>
-                    <IconRefresh />
-                  </span>
-                </button>
-              )}
+              <button
+                className="icon-btn"
+                title="刷新"
+                onClick={(e) => {
+                  e.stopPropagation()
+                  void refresh(p.meta.id)
+                }}
+              >
+                <span className={slot?.loading ? 'spin' : ''}>
+                  <IconRefresh />
+                </span>
+              </button>
               <button className="icon-btn" title="在新窗口查看用量详情" onClick={() => onOpenDetail(p.meta.id, p.meta.name)}>
                 <IconExpand />
               </button>
             </header>
 
-            {!p.configured && (
-              <div className="card-body muted-row">
-                尚未配置密钥
-                <button className="link-btn" onClick={onOpenSettings}>
-                  去配置
-                </button>
+            {slot?.loading && !slot.summary && <div className="card-body muted-row">加载中…</div>}
+            {slot?.error && !slot.summary && (
+              <div className="card-body error-row">
+                <div>{slot.error}</div>
+                {p.canLogin && (
+                  <button
+                    className="link-btn"
+                    disabled={loggingIn[p.meta.id]}
+                    onClick={() => void login(p.meta.id)}
+                  >
+                    {loggingIn[p.meta.id] ? '等待浏览器授权…' : `登录${p.meta.name}`}
+                  </button>
+                )}
               </div>
             )}
-
-            {p.configured && slot?.loading && !slot.summary && <div className="card-body muted-row">加载中…</div>}
-            {p.configured && slot?.error && !slot.summary && <div className="card-body error-row">{slot.error}</div>}
 
             {slot?.summary && (
               <div className="card-body">
@@ -135,6 +156,7 @@ export function SummaryView({ onOpenDetail, onOpenSettings }: Props): JSX.Elemen
                 )}
 
                 <div className="card-foot">
+                  {slot.summary.status && <span>{slot.summary.status}</span>}
                   {slot.summary.period && (
                     <span>
                       {new Date(slot.summary.period.startMs).toLocaleDateString('zh-CN')} ~{' '}

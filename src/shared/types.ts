@@ -84,6 +84,8 @@ export interface UsageDetail {
 export interface ProviderState {
   meta: ProviderMeta
   configured: boolean
+  /** 该供应商支持应用内授权登录（如百炼 CLI 控制台登录） */
+  canLogin?: boolean
   summary?: UsageSummary
   error?: string
 }
@@ -101,6 +103,8 @@ export interface UsageApi {
     providerId: string,
     values: Record<string, string>
   ): Promise<Result<UsageSummary>>
+  /** 应用内登录（如百炼控制台 OAuth），返回结果说明文案 */
+  loginProvider(providerId: string): Promise<Result<string>>
   setHeight(height: number): void
   mouseEnter(): void
   mouseLeave(): void

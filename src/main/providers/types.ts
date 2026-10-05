@@ -10,6 +10,14 @@ export interface ProviderAdapter {
   meta: ProviderMeta
   fetchSummary(config: ProviderConfig): Promise<UsageSummary>
   fetchDetail(config: ProviderConfig, days: number): Promise<UsageDetail>
+  /** 可选：需要交互式授权（如浏览器 OAuth 登录）的供应商提供 */
+  login?(): Promise<string>
+  /**
+   * 是否具备可用凭证（已保存配置或已登录）。
+   * 缺省实现为 configStore 中所有字段非空；凭证存于外部体系
+   * （如百炼 CLI 登录态）的供应商应自行覆盖此方法。
+   */
+  isAvailable?(config: ProviderConfig): boolean | Promise<boolean>
 }
 
 export class ProviderApiError extends Error {

@@ -3,7 +3,7 @@ import { api } from './api'
 import { SummaryView } from './views/SummaryView'
 import { DetailView } from './views/DetailView'
 import { SettingsView } from './views/SettingsView'
-import { IconClose, IconGear, IconPin } from './components/Icons'
+import { IconClose, IconExpand, IconGear, IconPin } from './components/Icons'
 
 /** 窗口路由：由 URL query 决定该窗口渲染概览面板、详情还是配置。 */
 type Route =
@@ -79,8 +79,15 @@ export default function App(): JSX.Element {
       <div className="panel" ref={contentRef}>
         <header className="panel-head">
           <span className="logo-dot" />
-          <span className="panel-title">Agent Usage</span>
+          <span className="panel-title">Plan Usage</span>
           <span className="spacer" />
+          <button
+            className="icon-btn"
+            title="查看全部用量详情"
+            onClick={() => api.openDetail('all', '全部供应商')}
+          >
+            <IconExpand />
+          </button>
           <button
             className={`icon-btn${pinned ? ' active' : ''}`}
             title={pinned ? '取消固定' : '固定面板'}

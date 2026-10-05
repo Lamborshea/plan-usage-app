@@ -8,6 +8,7 @@ const api: UsageApi = {
   fetchSummary: (id) => ipcRenderer.invoke('usage:summary', id),
   fetchDetail: (id, days) => ipcRenderer.invoke('usage:detail', id, days),
   testConfig: (id, values) => ipcRenderer.invoke('providers:test', id, values),
+  loginProvider: (id) => ipcRenderer.invoke('providers:login', id),
   setHeight: (height) => ipcRenderer.send('window:set-height', height),
   mouseEnter: () => ipcRenderer.send('window:mouse-enter'),
   mouseLeave: () => ipcRenderer.send('window:mouse-leave'),
