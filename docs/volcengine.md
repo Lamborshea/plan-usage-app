@@ -40,7 +40,7 @@ POST https://ark.cn-beijing.volcengineapi.com/?Action=GetAFPUsage&Version=2024-0
 | `AFPWeekly` | Window | 本周滚动窗口 |
 | `AFPMonthly` | Window | 本月滚动窗口 |
 
-Window 结构（单位 AFP，Agent Frame Point；时间均为 epoch 毫秒）：
+Window 结构（单位 AFP，Agent Frame Point）：
 
 | 字段 | 类型 | 说明 |
 |---|---|---|
@@ -48,6 +48,8 @@ Window 结构（单位 AFP，Agent Frame Point；时间均为 epoch 毫秒）：
 | `Used` | number | 窗口内已用量 |
 | `SubscribeTime` | number | 窗口起始时间 |
 | `ResetTime` | number | 下次重置时间 |
+
+> ⚠️ 时间单位：官方文档标注为 epoch 毫秒，但**实测返回的是 epoch 秒**（如 `1785892740` ≈ 2026-08-05，若当毫秒解析会显示 1970/1/21）。客户端在 `fetchAFPUsage` 中已按 `< 1e11 视为秒` 归一化为毫秒。
 
 > 仅适用于个人版；企业版席位请改用 `GetSeatAFPUsage`。
 

@@ -47,7 +47,7 @@ interface UsageDetailsResponse {
   Result?: { Details: UsageDetailItem[] }
 }
 
-/** AFP 滚动窗口配额（GetAFPUsage），时间均为 epoch 毫秒 */
+/** AFP 滚动窗口配额（GetAFPUsage）。接口实际返回秒级时间戳，经 normalizeWindow 归一化为 epoch 毫秒 */
 interface AFPWindow {
   /** 窗口总配额（AFP） */
   Quota: number
@@ -123,9 +123,24 @@ async function fetchUsageDetails(
   return json.Result?.Details ?? []
 }
 
+/** 秒/毫秒时间戳兼容：小于 1e11 视为秒（1973 年前的毫秒值不存在，可安全区分） */
+const toMs = (t: number): number => (t < 1e11 ? t * 1000 : t)
+
+const normalizeWindow = (w?: AFPWindow): AFPWindow | undefined =>
+  w && { ...w, SubscribeTime: toMs(w.SubscribeTime), ResetTime: toMs(w.ResetTime) }
+
 async function fetchAFPUsage(config: ProviderConfig): Promise<AFPUsageResponse['Result']> {
   const json = await postArk<AFPUsageResponse>('GetAFPUsage', config, '{}')
-  return json.Result
+  const r = json.Result
+  if (!r) return undefined
+  // 实测接口返回 epoch 秒（与官方文档标注的毫秒不一致），统一归一化为毫秒
+  return {
+    PlanType: r.PlanType,
+    AFPFiveHour: normalizeWindow(r.AFPFiveHour),
+    AFPDaily: normalizeWindow(r.AFPDaily),
+    AFPWeekly: normalizeWindow(r.AFPWeekly),
+    AFPMonthly: normalizeWindow(r.AFPMonthly)
+  }
 }
 
 function groupByModel(
