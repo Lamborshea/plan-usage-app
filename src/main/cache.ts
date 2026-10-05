@@ -227,8 +227,10 @@ export async function preheatAll(): Promise<void> {
   for (const provider of allProviders()) {
     let available = false
     try {
-      const config = resolveConfig(provider) ?? {}
-      available = provider.isAvailable ? await provider.isAvailable(config) : provider.meta.fields.length === 0 || configStore.isConfigured(provider.meta.id)
+      const config = resolveConfig(provider)
+      // 未配置密钥的供应商直接跳过，避免空配置拉取写入错误快照
+      if (config === null) continue
+      available = provider.isAvailable ? await provider.isAvailable(config) : configStore.isConfigured(provider.meta.id)
       if (!available) continue
       const entry = await startRefresh(`summary:${provider.meta.id}`, () => fetchSummaryFresh(provider, config))
       if (entry.kind === 'summary' && entry.data) {
